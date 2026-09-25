@@ -140,7 +140,33 @@ details.raw summary{cursor:pointer;color:var(--dim);font-size:12px}
 details.raw pre{background:var(--panel2);border-radius:6px;padding:8px;overflow:auto;
   max-height:260px;font-size:11px;color:var(--dim)}
 #sseState{font-size:11.5px;color:var(--faint);font-family:var(--mono)}
+/* fit-mode (default): the 100vh column layout above. */
+/* full mode: panels render at their NATURAL content height (no flex
+   fractions, no overflow clipping) and the PAGE scrolls; the log pane
+   keeps a fixed height with its own internal scroll so the tail-f
+   scroll-pause logic keys off #log's scroll in either mode. The class is
+   set on <html> by the head script (documentElement exists pre-<body>), so
+   it applies before first paint. */
+html.full{height:auto}
+html.full body{height:auto;min-height:100vh}
+html.full .main{flex:0 1 auto}
+/* panel flex fractions live at ID specificity (#livePanel etc.), so the
+   full-mode overrides must name the ids to win: natural content height,
+   no clipping. */
+html.full #livePanel, html.full #counters, html.full #memPanel,
+html.full #histPanel{flex:1 1 auto;overflow:visible}
+html.full .logwrap{flex:0 0 auto;height:auto;min-height:300px;max-height:50vh}
+/* "Fit on screen" toggle in the header */
+#fitWrap{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;
+  color:var(--dim);cursor:pointer;user-select:none}
+#fitWrap input{accent-color:var(--accent);margin:0;cursor:pointer}
 </style>
+<script>
+/* Apply the persisted "Fit on screen" mode to <html> BEFORE the rest of the
+   body paints, so a reload in full mode never flashes fit mode (or vice
+   versa). "1"/absent = fit (default); "0" = full. */
+if(localStorage.getItem("splashDashFitMode")==="0")document.documentElement.classList.add("full");
+</script>
 </head>
 <body>
 <div id="hdr">
@@ -151,6 +177,11 @@ details.raw pre{background:var(--panel2);border-radius:6px;padding:8px;overflow:
   <span class="hstat">pid <b id="hPid">—</b></span>
   <span class="hstat">port <b id="hPort">—</b></span>
   <span class="spacer"></span>
+  <label id="fitWrap" title="On = panels compress to fill the viewport, no page scroll.
+    Off = panels show full content, the page scrolls to the log stream.
+    (choice is remembered)">
+    <input type="checkbox" id="fitTgl" checked> Fit on screen
+  </label>
   <span class="hstat">schema <b id="hSchema">—</b> · build <b id="hBuild">—</b> ·
     <span id="hLastPoll">last poll —</span></span>
   <div id="devline"></div>

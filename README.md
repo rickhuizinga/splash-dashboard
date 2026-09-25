@@ -87,6 +87,13 @@ mismatch** banner (engine HTTP 401/403) rather than fake data.
   (Ready green / Done default / Cancelled yellow / Error red / Loading blue),
   TTFT & tok/s right-aligned, tail-f scroll behavior (scroll up pauses,
   "N new lines" chip resumes), 5,000-line in-memory cap.
+- **Fit on screen toggle** (header, persisted in `localStorage`): on = the
+  default — the whole page fills the viewport with no vertical scroll and the
+  four mid panels (Live state / Counters / Memory / Latency histograms)
+  compress to fit; off = those four panels render at their natural content
+  height and the page scrolls vertically down to the log stream (useful on
+  short / laptop viewports). The choice is remembered across reloads and
+  applied before first paint, so there is no mode flash.
 
 ## Failure-mode behavior
 

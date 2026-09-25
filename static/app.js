@@ -8,6 +8,23 @@
 const $ = (id) => document.getElementById(id);
 const GIB = 1073741824;
 
+/* Fit-on-screen mode. "1"/absent = fit (default, panels compress to the
+ * viewport, no page scroll); "0" = full (panels at natural height, page
+ * scrolls). The <head> script in index.html applies the persisted class to
+ * <html> BEFORE first paint (no flash); here we only (re)sync the control
+ * and handle live toggling. Key name must match index.html's head script. */
+const FIT_KEY = "splashDashFitMode";
+function fitMode() { return localStorage.getItem(FIT_KEY) === "0" ? "full" : "fit"; }
+function applyFitMode(mode) {
+  document.documentElement.classList.toggle("full", mode === "full");
+}
+function setFitMode(mode) {
+  localStorage.setItem(FIT_KEY, mode === "full" ? "0" : "1");
+  applyFitMode(mode);
+  const tgl = $("fitTgl");
+  if (tgl) tgl.checked = mode === "fit";
+}
+
 const S = {
   status: null,        // last good /status payload
   engine: "unknown",   // unknown | ok | down | auth
@@ -571,6 +588,14 @@ function init() {
     if (e.key === "p" && !/input|textarea|select/i.test(document.activeElement.tagName)) {
       $("btnPause").click();
     }
+  });
+  // Fit-on-screen toggle (checked = fit mode = default). The head script in
+  // index.html already applied the persisted mode to <html> pre-paint; here
+  // we sync the checkbox and persist live changes.
+  const fitTgl = $("fitTgl");
+  fitTgl.checked = (fitMode() === "fit");
+  fitTgl.addEventListener("change", () => {
+    setFitMode(fitTgl.checked ? "fit" : "full");
   });
   openLogStream();
   pollStatus();
