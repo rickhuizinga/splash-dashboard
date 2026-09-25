@@ -18,9 +18,11 @@ Works with any model Splash serves; developed against
 
 ## Files
 
-- `dash.py` — backend. **Python 3 stdlib only** (no pip). Binds
-  `127.0.0.1:8280` (localhost only — the splash API key is proxied here and
-  must never be LAN-reachable). Routes:
+- `dash.py` — backend. **Python 3 stdlib only** (no pip). Binds all
+  interfaces on `:8280` by default (pass `--host 127.0.0.1` for
+  loopback-only). The splash API key is proxied server-side and never sent
+  to the browser; the dashboard itself is unauthenticated, so bind it only
+  to networks you trust (loopback, tailnet, or your home LAN). Routes:
   - `GET /` → `static/index.html`
   - `GET /api/status` → proxies engine `/status`, injects bearer key, 2 s
     cache. Emits explicit `engine_down` / `auth` states — never silent zeros.
