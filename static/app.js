@@ -30,9 +30,12 @@ const S = {
   engine: "unknown",   // unknown | ok | down | auth
   startedAt: null,     // last-seen instance.started_at (restart detection)
   prev: {},            // previous poll values (delta arrows)
-  histBase: null,      // cumulative buckets at reset (per metric) — see below
-  histSamples: {},     // diffed counts since reset (per metric)
-  lastEdgeKeys: {},    // per-metric key of last rendered bucket edge set
+  histBase: null,      // per metric: engine-native {edges,cum} at the last baseline
+                       // reset (page load / engine restart / native shape drift)
+  histEdges: {},       // per metric: {edges, lo, hi} — current adaptive display
+                       // edge set + the p1/p99 range it was derived from; kept so
+                       // re-derivation only fires on a meaningful distribution shift
+  lastEdgeKeys: {},    // per-metric key of last rendered native bucket edge set
   lastPollAt: null,
   // log pane
   atBottom: true,
@@ -106,19 +109,23 @@ async function pollStatus() {
     onEngineRestart(sa);
   }
   S.startedAt = sa;
-  // histogram base: seed on first good poll; reset after a restart.
-  // Store the FULL edgeCum() result ({edges, cum}) — renderHistograms reads
-  // base.edges.join(",") to detect shape drift, so a bare cum array would
-  // throw on every bucket change and leave the panel empty.
+  // Histogram baseline: seed on first good poll, reset after an engine
+  // restart. Store the FULL edgeCum() result ({edges, cum}) — renderHistograms
+  // compares base.edges against the live edge set to detect shape drift.
+  // Bars then show NEW samples since load/reset, diffed at NATIVE engine
+  // resolution and re-binned into adaptive display edges (see renderHistograms).
   if (!S.histBase) {
     S.histBase = {};
-    S.histSamples = {};
+    S.histEdges = {};                   // left unset per metric until the first
+                                        // real sample batch lands (the baseline
+                                        // equals the current buckets, so newCum
+                                        // is zero and no scale can be derived)
+    S.lastEdgeKeys = {};
     for (const k of ["ttft", "itl", "queue"]) {
       const secName = k === "itl" ? "output_interval" : k === "queue" ? "native_queue" : "ttft";
       const ec = edgeCum(st.latency && st.latency[secName]);
       if (!ec) { S.histBase[k] = null; continue; }
       S.histBase[k] = ec;               // baseline = what the engine already has
-      S.histSamples[k] = { count: 0, dist: zeros(BUCKET_EDGES.length) };
     }
   }
   renderAll(st);
@@ -159,7 +166,7 @@ function setEngineState(state, detail) {
 function onEngineRestart(sa) {
   // counters & latency buckets are engine-lifetime: reset client history.
   S.histBase = null;
-  S.histSamples = {};
+  S.histEdges = {};
   S.lastEdgeKeys = {};
   S.prev = {};
   insertDivider("⟳ engine restarted " +
@@ -343,19 +350,215 @@ function p_kv(p) {
   return p.kv || {};
 }
 
-/* ---------------- latency histograms (client-diffed) ----------------
- * The engine reports cumulative buckets since its start. We seed a base on
- * first poll (after any restart) and diff subsequent polls, so the bars show
- * NEW samples observed since page load / engine restart. 10 hand-rolled
- * buckets (no chart lib).
+/* ---------------- latency histograms (client-diffed, adaptive edges) -----
+ * The engine reports CUMULATIVE buckets since its start, at 18 fixed native
+ * edges (0.001 … 1800 s + Inf) — far finer than any single fixed display
+ * scale: ITL is sub-second (100 ms-ish), TTFT is multi-second/minute, queue
+ * is tens of ms to minutes. Rendering one static edge set for all three
+ * collapsed ITL into a single "<1s" bar, so the histogram conveyed nothing.
+ *
+ * Instead we diff the engine's native cumulative buckets (cumulative → delta,
+ * as before) to get the NEW samples since the last baseline reset (page load
+ * / engine restart / native shape drift), then derive ADAPTIVE display edges
+ * from that observed distribution: the 1st–99th percentile range, log-spaced
+ * into 8 bars, anchored at 0 and ∞ (adaptiveEdges below). The three metrics
+ * each get their own scale + labels. The edges are re-derived only when the
+ * observed p1/p99 range shifts ≥3× (concurrency rising → ITL stretches; a
+ * quieting engine → ITL tightens), and a re-derivation re-anchors the "since
+ * load/reset" baseline (the task's documented re-derive semantics). Bars are
+ * redrawn from the native intervals each poll; the count of new samples is
+ * the panel's total, and largest-remainder rounding keeps the integer bar
+ * heights summing exactly to it. A metric that has <30 new samples in its
+ * window renders one honest "all: N" bar until enough samples arrive to
+ * judge a scale (no noise-fit buckets).
  */
 const HIST_DEFS = [
   { key: "ttft",  label: "TTFT",  unit: "s",  ms: null },
   { key: "itl",   label: "ITL",   unit: "s",  ms: 1000 },
   { key: "queue", label: "Queue", unit: "s",  ms: null },
 ];
-const BUCKET_EDGES = [1, 5, 30, 120, 300, 900, 1800, Infinity];
-const BUCKET_LABELS = ["<1s", "1-5s", "5-30s", "30-2m", "2-5m", "5-15m", "15-30m", "≥30m"];
+const ADAPT_BARS = 7;           // 7 log-spaced edges between 0 and Infinity = 8
+                                // display bars (same count as the old static set)
+const ADAPT_LO_Q = 0.01;        // first display edge = the 1st percentile of the
+                                // new samples (anchors the informative low end)
+const ADAPT_HI_Q = 0.99;        // last display edge = the 99th percentile (the
+                                // sliver above it goes into the terminal ≥ bar,
+                                // so a lone tail outlier cannot stretch the scale)
+const ADAPT_MIN_SAMPLES = 30;   // below this many new samples the edge set is not
+                                // re-derived (too few to judge a real shift)
+const ADAPT_SHIFT = 3;          // re-derive once the observed p1/p99 range moves
+                                // ≥ this factor (in log space) from the range the
+                                // current edges were derived from
+
+function edgeCumKey(edges) { return edges.join(","); }
+
+/* Invert the new-sample CDF: the value v such that ~q of the new samples are
+ * <= v. Interpolates in log space between the engine's native cumulative
+ * edges (the native buckets are themselves a log grid, so this is the
+ * honest density assumption). Returns Infinity when the target quantile
+ * falls in the +Inf tail (samples past 30 min — unbounded). */
+function quantileAt(edges, cum, q) {
+  const total = cum.length ? cum[cum.length - 1] || 0 : 0;
+  if (total <= 0) return null;
+  const target = q * total;
+  for (let i = 0; i < edges.length; i++) {
+    if (cum[i] >= target) {
+      const e = edges[i];
+      if (!Number.isFinite(e)) return Infinity;            // +Inf tail
+      if (i === 0) return e * (target / cum[i]);          // [0, e]: linear
+      const lo = edges[i - 1];
+      const c0 = cum[i - 1];
+      const f = cum[i] > c0 ? (target - c0) / (cum[i] - c0) : 0;
+      return lo * Math.pow(e / lo, f);
+    }
+  }
+  return Infinity;                                          // past the last edge
+}
+
+/* Choose adaptive display edges for one metric from the NEW samples since the
+ * baseline: the 1st–99th percentile range, log-spaced into ADAPT_BARS bars,
+ * anchored at 0 and Infinity. This is the task's primary approach — and it is
+ * REQUIRED (not just convenient) because the engine's native buckets can put
+ * most of the mass into a single bucket (e.g. ITL: ~80% of new samples in the
+ * one (0.25, 0.5] bucket), which any merge-of-native-edges scheme would
+ * collapse into one >70% bar. Interpolated edges can subdivide that bucket.
+ *
+ * Layout: [0] + (ADAPT_BARS edges spanning p1..p99, geometric) + [Infinity].
+ * So the first bar holds the bottom 1%, the middle ADAPT_BARS-1 bars hold the
+ * middle 98%, the last bar the top 1% — 8 bars total with ADAPT_BARS=7.
+ *
+ * Pure function of the distribution (no clock / RNG): a given payload always
+ * yields the same edges.
+ *
+ * @param nativeEdges  engine edge upper-bounds, ascending; last = Infinity
+ * @param newCum       cumulative count of NEW samples per native edge (monotone)
+ * @return {edges:[0,…,Infinity], lo, hi} or null when there are no new samples
+ */
+function adaptiveEdges(nativeEdges, newCum) {
+  const total = newCum.length ? newCum[newCum.length - 1] || 0 : 0;
+  if (!nativeEdges.length || total <= 0) return null;       // no data yet
+  const finite = nativeEdges.filter((e) => Number.isFinite(e));
+  if (!finite.length) return null;
+  const lo = quantileAt(nativeEdges, newCum, ADAPT_LO_Q);
+  let hi = quantileAt(nativeEdges, newCum, ADAPT_HI_Q);
+  if (hi === Infinity) hi = finite[finite.length - 1];      // clamp the tail
+  if (hi == null || !(hi > 0)) {
+    return { edges: [0, Infinity], lo: 0, hi: 0 };         // single bucket
+  }
+  if (lo == null || lo <= 0 || hi / lo < 2) {
+    // Mass within a <2× range (or starting from 0): one bar + the ≥ bar.
+    return { edges: [0, hi, Infinity], lo: lo || 0, hi };
+  }
+  const out = [0];
+  const r = Math.pow(hi / lo, 1 / (ADAPT_BARS - 1));        // log step ratio
+  for (let k = 0; k < ADAPT_BARS; k++) out.push(lo * Math.pow(r, k));
+  out.push(Infinity);
+  // strictly-ascending safety (a duplicate edge would create a zero bar)
+  const edges = out.filter((e, i, a) => i === 0 || e > a[i - 1]);
+  return { edges, lo, hi };
+}
+
+/* Human label for a display edge upper-bound (seconds): 120ms, 2s, 15s, 1m…
+ * Rounding happens only here, for display — the edges stay exact. */
+function edgeLabel(sec) {
+  if (sec == null || !Number.isFinite(sec)) return "≥";       // terminal bar
+  if (sec < 0.001) return "<1ms";
+  if (sec < 1) return Math.round(sec * 1000) + "ms";
+  if (sec < 60) return (Number.isInteger(sec) ? sec : sec.toFixed(1)) + "s";
+  if (sec < 3600) {
+    const m = sec / 60;
+    return (Number.isInteger(m) ? m : m.toFixed(1)) + "m";
+  }
+  return (sec / 3600).toFixed(1) + "h";
+}
+
+/* Project the new-sample counts onto the display edges. Each native interval
+ * (a, b] may span several display bars (the display edges are interpolated,
+ * not a native subset), so its mass is split across the overlapping bars in
+ * proportion to their log lengths — the same log-uniform density the CDF
+ * inversion assumes. Fractional remainders land on the last overlap, so the
+ * floating-point split sums to exactly the interval's count.
+ *
+ * Display rounding is then LARGEST-REMINDER: bar heights are integers that
+ * sum to EXACTLY round(total) — so the rendered bars always reconcile with
+ * the caption's total (per-bar Math.round would drift by ±1-2 samples).
+ * Returns { dist: int counts parallel to dispEdges, total: exact sum }. */
+function mapNativeToDisplay(nativeEdges, newCum, dispEdges) {
+  const n = dispEdges.length;
+  const dist = zeros(n);
+  for (let i = 0; i < newCum.length; i++) {
+    const m = newCum[i] - (i > 0 ? newCum[i - 1] : 0);
+    if (m <= 0) continue;
+    const a = i > 0 ? nativeEdges[i - 1] : 0;
+    const b = nativeEdges[i];
+    // Collect the display bins overlapping (a, b].
+    const overlaps = [];
+    for (let d = 0; d < n - 1; d++) {
+      const x = dispEdges[d];
+      const y = dispEdges[d + 1];
+      const oLo = Math.max(a, x);
+      const oHi = Number.isFinite(y) ? Math.min(b, y) : b;
+      if (oHi > oLo) {
+        // log length of the overlap; a=0 needs a floor (log is undefined at 0)
+        const lo = oLo > 0 ? oLo : Math.max(b * 1e-6, 1e-9);
+        overlaps.push([Math.log(oHi) - Math.log(lo), d]);
+      }
+    }
+    if (!overlaps.length) continue;                 // unreachable in practice
+    const totalLen = overlaps.reduce((s, o) => s + o[0], 0);
+    if (totalLen <= 0) {
+      dist[overlaps[0][1]] += m;                    // degenerate: whole interval
+      continue;
+    }
+    let assigned = 0;
+    for (let k = 0; k < overlaps.length; k++) {
+      const frac = overlaps[k][0] / totalLen;
+      // Last overlap takes the exact remainder so the split sums to m.
+      const v = (k === overlaps.length - 1) ? m - assigned : m * frac;
+      if (k < overlaps.length - 1) assigned += m * frac;
+      dist[overlaps[k][1]] += Math.max(0, v);
+    }
+  }
+  // Largest-remainder rounding (see doc).
+  const total = dist.reduce((a, b) => a + b, 0);
+  const target = Math.round(total);
+  const ints = dist.map((v) => Math.floor(v + 1e-9));
+  let deficit = target - ints.reduce((a, b) => a + b, 0);
+  if (deficit > 0) {
+    const order = dist.map((v, i) => [v - Math.floor(v + 1e-9), i])
+      .sort((p, q) => q[0] - p[0] || q[1] - p[1]);
+    for (let k = 0; k < order.length && deficit > 0; k++, deficit--) {
+      ints[order[k][1]]++;
+    }
+  }
+  return { dist: ints, total };
+}
+
+/* Has the observed new-sample distribution shifted enough that the display
+ * edges should be re-derived (and the "since load/reset" baseline re-anchored)?
+ * Shape-based, not a wall clock: the current p1/p99 range must move by at
+ * least ADAPT_SHIFT× (log space) from the range the current edges were derived
+ * from. A rising concurrency (ITL stretches) or a quieting engine (ITL
+ * tightens) crosses that; normal sample-by-sample churn does not, so the bars
+ * don't reset on every poll. */
+function edgesStale(nativeEdges, newCum, dispEdges, derived) {
+  const total = newCum.length ? newCum[newCum.length - 1] || 0 : 0;
+  if (total < ADAPT_MIN_SAMPLES || !dispEdges) return false;
+  if (!derived) return false;                       // first derivation handled elsewhere
+  const lo = quantileAt(nativeEdges, newCum, ADAPT_LO_Q);
+  const hi = quantileAt(nativeEdges, newCum, ADAPT_HI_Q);
+  if (!Number.isFinite(lo) || lo <= 0) return false;
+  if (!(derived.lo > 0) || !(derived.hi > 0)) return false;
+  // p99 in the +Inf tail (> 30 min): the scale is already at its widest
+  // possible form (adaptiveEdges clamps hi to the last native edge, 1800 s)
+  // and the tail sits in the ≥ bar — re-deriving would be a no-op that only
+  // clears the counter, so stay put.
+  if (!Number.isFinite(hi)) return false;
+  const shift = Math.max(
+    Math.abs(Math.log(lo / derived.lo)),
+    Math.abs(Math.log(hi / derived.hi)));
+  return shift > Math.log(ADAPT_SHIFT);
+}
 
 function renderHistograms(p) {
   const box = $("histBox");
@@ -376,34 +579,90 @@ function renderHistograms(p) {
     // each poll, so a "skip if cumulative unchanged" gate would leave only the
     // metric(s) that gained samples in that exact poll — i.e. a near-empty
     // panel in steady state (ITL ticks every poll; TTFT/Queue are often quiet).
-    // Rebuilding all three is trivially cheap (3 metrics × 8 bars every 5 s).
-    S.lastEdgeKeys[def.key] = cur.edges.join(",") + "|" + cur.cum.join(",");
+    // Rebuilding all three is trivially cheap (3 metrics × ≤8 bars every 5 s).
+    S.lastEdgeKeys[def.key] = edgeCumKey(cur.edges) + "|" + cur.cum.join(",");
     any = true;
     // The engine reports CUMULATIVE buckets (count of samples <= edge).
-    // Diff vs the base, then take per-interval deltas so each sample is
-    // counted exactly once, in the bin of its upper edge.
+    // Diff vs the baseline native shape, then take per-interval deltas so each
+    // NEW sample is counted exactly once, in the bin of its (native) upper edge.
+    //
+    // Baseline semantics (unchanged from the static-bucket version):
+    //   - on first good poll, base = the engine's current cumulative buckets,
+    //     so the panel starts at zero "since load";
+    //   - if the native edge SET drifted (engine changed bucket shape), the
+    //     base is no longer comparable -> treat base = current (show everything).
     const base = (S.histBase[def.key] &&
                   S.histBase[def.key].edges.join(",") === cur.edges.join(","))
-      ? S.histBase[def.key] : cur;   // shape drifted -> show everything
-    const dist = zeros(BUCKET_EDGES.length);
+      ? S.histBase[def.key] : cur;
+    // NEW samples since the baseline, as a per-native-edge CUMULATIVE count
+    // (count of new samples <= edge_i). The per-interval delta (cur-base) is
+    // running-summed into a cumulative, which is what the adaptive edge
+    // chooser, the mapper, and the staleness check all consume.
+    const newCum = zeros(cur.edges.length);
+    let run = 0;
     cur.edges.forEach((edge, i) => {
-      // per-interval: samples landing in (edges[i-1], edges[i]]
       const interval = Math.max(0, cur.cum[i] - base.cum[i] -
         (i > 0 ? (cur.cum[i - 1] - base.cum[i - 1]) : 0));
-      let bi = BUCKET_EDGES.findIndex((be) =>
-        (!Number.isFinite(be) && !Number.isFinite(edge)) ||
-        (Number.isFinite(be) && edge <= be));
-      if (bi < 0) bi = BUCKET_EDGES.length - 1;  // +Inf edge -> last bin
-      dist[bi] += interval;
+      run += interval;
+      newCum[i] = run;
     });
-    const total = dist.reduce((a, b) => a + b, 0);
+    const newTotal = run;
+    // Adaptive display edges for THIS metric. First batch with ≥30 new
+    // samples: derive (below that, no scale — the "all" bar). Afterwards:
+    // keep the current scale (bars don't jiggle on every poll) until the
+    // observed p1/p99 range shifts ≥ ADAPT_SHIFT× — then re-derive AND
+    // re-anchor the "since load/reset" baseline, so the counter restarts
+    // with the new scale (the task's documented re-derive semantics).
+    let rederived = false;
+    if (!S.histEdges[def.key]) {
+      // Floor here too: a scale derived from <30 samples (e.g. a TTFT that
+      // logged 3 requests in 30 s) would anchor its bars to noise. Until the
+      // window accumulates enough to judge, one "all: N" bar is the honest
+      // rendering — and once 30 land, the scale derives and holds.
+      // No baseline re-anchor here: the window is still the page-load window
+      // ("since load/reset" stays truthful — the counter keeps the samples the
+      // user watched accumulate through the placeholder phase). Re-anchoring
+      // happens only on a mid-life re-derivation below.
+      S.histEdges[def.key] = newTotal >= ADAPT_MIN_SAMPLES
+        ? adaptiveEdges(cur.edges, newCum) : null;
+    } else if (newTotal >= ADAPT_MIN_SAMPLES &&
+               edgesStale(cur.edges, newCum, S.histEdges[def.key].edges,
+                          S.histEdges[def.key])) {
+      S.histEdges[def.key] = adaptiveEdges(cur.edges, newCum);
+      // Re-ANCHOR the baseline (task's documented re-derive semantics): the
+      // "since load/reset" window restarts with the new scale, so every native
+      // cum value in this very poll is now pre-window. Zeroing newCum is
+      // EXACT, not a shortcut: re-anchored base = cur, so the true
+      // cumulative→delta diff against the new baseline is 0 for this poll.
+      // (The samples that triggered the shift were already shown last poll,
+      // under the old scale — they are pre-window now, by design.)
+      S.histBase[def.key] = { edges: cur.edges, cum: cur.cum.slice() };
+      newCum.fill(0);
+      rederived = true;
+    }
+    const disp = S.histEdges[def.key];
+    const mapped = disp ? mapNativeToDisplay(cur.edges, newCum, disp.edges)
+      : { dist: [0], total: 0 };                   // single "all" bar, awaiting
+                                                   // enough samples to derive a scale
+    const dist = mapped.dist;
+    const total = mapped.total;
     const max = Math.max(1, ...dist);
+    // dist is INTERVAL-indexed: dist[i] = count of bar i = interval
+    // (dEdges[i], dEdges[i+1]]. Iterate the bars (all but the last edge) —
+    // indexing dist by the raw edge array would read one interval off (the
+    // final bar would always show 0) and mislabel every range.
+    const dEdges = disp ? disp.edges : [0, Infinity];
     let bars = "", labs = "";
-    dist.forEach((v, i) => {
+    dEdges.slice(0, -1).forEach((lo, i) => {
+      const de = dEdges[i + 1];
+      const v = dist[i];
       const h = Math.max(2, Math.round(v / max * 100));
-      const hi = v === max && v > 0 ? " hi" : "";
-      bars += `<div class="b" title="${BUCKET_LABELS[i]}: ${fmtInt(v)} new"><i style="height:${h}%" class="${hi}"></i></div>`;
-      labs += `<span>${BUCKET_LABELS[i]}</span>`;
+      const hic = v === max && v > 0 ? " hi" : "";
+      const label = Number.isFinite(de)
+        ? (lo === 0 ? "0" : edgeLabel(lo)) + "…" + edgeLabel(de)
+        : (lo === 0 ? "all" : "≥" + edgeLabel(lo));   // terminal tail bar
+      bars += `<div class="b" title="${esc(label)}: ${fmtInt(v)} new"><i style="height:${h}%" class="${hic}"></i></div>`;
+      labs += `<span>${esc(label)}</span>`;
     });
     const m = p.metrics || {};
     // ttft_ms/itl_ms can be null on idle polls — humanMs(null) prints "—"
@@ -413,7 +672,8 @@ function renderHistograms(p) {
       `p50 ${humanMs(rt && rt.p50)}`;
     const el = document.createElement("div");
     el.className = "hist";
-    el.innerHTML = `<div class="hcap"><span>${def.label} · new samples since load/reset: <b style="color:var(--fg)">${fmtInt(total)}</b></span><span class="rt">${rtTxt}</span></div>
+    const since = rederived ? "since scale re-anchored" : "since load/reset";
+    el.innerHTML = `<div class="hcap"><span>${def.label} · new samples ${since}: <b style="color:var(--fg)">${fmtInt(total)}</b></span><span class="rt">${rtTxt}</span></div>
       <div class="bars">${bars}</div><div class="hlab">${labs}</div>`;
     box.appendChild(el);
   }
