@@ -8,7 +8,7 @@ and a live log tail (`tail -f`-style).
 Works with any model Splash serves; developed against
 `incoai/Qwen3.8-27B-Splash` on a Mac Mini M4 Pro (macOS 27).
 
-![dashboard](https://placeholder-no-screenshot-yet)
+![Splash Engine Dashboard — live view showing engine state, throughput, memory, latency histograms, and log stream](docs/screenshot.png)
 
 ## Requirements
 
