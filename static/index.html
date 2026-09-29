@@ -63,9 +63,42 @@ body{margin:0;background:var(--bg);color:var(--fg);
 .col{display:flex;flex-direction:column;gap:8px;min-height:0}
 .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;
   padding:10px 12px;min-height:0;overflow:hidden}
+/* Only the card's TOP-LEVEL title bar is the collapse hit target (the
+   .panel > h3). Inner section h3s (e.g. "Current decode batch") keep the
+   same look but no pointer cursor — they are not clickable. */
+.panel > h3{margin:0 0 6px;font-size:11.5px;text-transform:uppercase;
+  letter-spacing:.9px;color:var(--dim);font-weight:600;display:flex;gap:8px;
+  cursor:pointer;user-select:none;min-height:32px;align-items:center}
 .panel h3{margin:0 0 6px;font-size:11.5px;text-transform:uppercase;
-  letter-spacing:.9px;color:var(--dim);font-weight:600;display:flex;gap:8px}
+  letter-spacing:.9px;color:var(--dim);font-weight:600}
 .panel h3 .tag{color:var(--faint);font-weight:400;text-transform:none;letter-spacing:0}
+/* Collapsible cards (t_d9b79b36). Collapsed state = a `col-<cardId>` class
+   on <html> — the single source of truth. The <head> script restores the
+   persisted set BEFORE the body exists, so hidden bodies + flipped chevrons
+   are in place at FIRST PAINT (no reflow flash, Fit or Full); app.js keeps
+   the classes in sync on click and persists a JSON map under COLLAPSE_KEY.
+   Everything below keys off those html classes (NOT a per-element class,
+   which a pre-paint script cannot set). The title bar — and any live
+   summary in it, e.g. #memTag "peak … GiB" — stays visible and keeps
+   rendering while the body is hidden. */
+.cvr{margin-left:auto;color:var(--faint);font-size:11px;transition:transform .12s}
+html.col-livePanel #livePanel .pbody,
+html.col-counters #counters .pbody,
+html.col-memPanel #memPanel .pbody,
+html.col-histPanel #histPanel .pbody{display:none}
+/* chevron: ▾ (down) = expanded; rotated 90° CCW to ▸ = collapsed — the
+   standard disclosure pair the task calls for (right-pointing when the
+   card is waiting to be opened). */
+html.col-livePanel #livePanel .cvr,
+html.col-counters #counters .cvr,
+html.col-memPanel #memPanel .cvr,
+html.col-histPanel #histPanel .cvr,
+html.col-logwrap .logwrap .cvr{transform:rotate(-90deg)}
+/* tight title-bar card: no extra margin under the h3 when the body is gone */
+html.col-livePanel #livePanel > h3,
+html.col-counters #counters > h3,
+html.col-memPanel #memPanel > h3,
+html.col-histPanel #histPanel > h3{margin-bottom:0}
 #livePanel{flex:1.2} #counters{flex:1} #memPanel{flex:1.4} #histPanel{flex:1}
 table.t{width:100%;border-collapse:collapse;font-size:13px}
 table.t td{padding:1px 0}
@@ -105,7 +138,8 @@ table.t td.v.ok{color:var(--green)}
   position:relative;overflow:hidden}
 .logwrap .lttl{display:flex;align-items:center;gap:10px;padding:6px 12px;
   border-bottom:1px solid var(--border);font-size:11.5px;text-transform:uppercase;
-  letter-spacing:.9px;color:var(--dim);font-weight:600}
+  letter-spacing:.9px;color:var(--dim);font-weight:600;min-height:32px;
+  cursor:pointer;user-select:none}
 .logwrap .lttl .spacer{flex:1}
 #log{flex:1;overflow-y:auto;padding:6px 12px;font-family:var(--mono);font-size:12.5px;
   scrollbar-width:thin;scrollbar-color:var(--border) transparent}
@@ -156,6 +190,26 @@ html.full .main{flex:0 1 auto}
 html.full #livePanel, html.full #counters, html.full #memPanel,
 html.full #histPanel{flex:1 1 auto;overflow:visible}
 html.full .logwrap{flex:0 0 auto;height:auto;min-height:300px;max-height:50vh}
+/* Collapsed cards release their flex slot (t_d9b79b36). Without this, a
+   hidden-body panel would still hold its flex fraction (basis 0%, grow-only)
+   and its sibling would NOT absorb the freed space — in Fit mode that is the
+   whole point of collapsing. flex-basis:auto makes the card shrink to the
+   title bar. Placed after the html.full overrides (equal specificity, later
+   wins) so collapsed stays collapsed in BOTH modes; inert when the class
+   is absent. */
+html.col-livePanel #livePanel, html.col-counters #counters,
+html.col-memPanel #memPanel, html.col-histPanel #histPanel{flex:0 0 auto}
+html.col-logwrap .logwrap{flex:0 0 auto;height:auto;min-height:0;max-height:none}
+/* Collapsed log: hide the body (and the pause chip, which overlays it).
+   The SSE stream + buffer keep running into the hidden DOM (see app.js):
+   a display:none #log reports zero geometry, so isAtBottom() reads "at
+   bottom" and clientHeight-0 guards in appendLog pin the tail without
+   counting lines — exactly the task's "treat as was at bottom" rule.
+   expandCard() re-syncs the view when the body re-appears. The title
+   bar alone remains (SSE state text + pause button stay live). */
+html.col-logwrap #log{display:none}
+html.col-logwrap #pauseChip{display:none}
+html.full.col-logwrap .logwrap{min-height:0}
 /* "Fit on screen" toggle in the header */
 #fitWrap{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;
   color:var(--dim);cursor:pointer;user-select:none}
@@ -166,6 +220,20 @@ html.full .logwrap{flex:0 0 auto;height:auto;min-height:300px;max-height:50vh}
    body paints, so a reload in full mode never flashes fit mode (or vice
    versa). "1"/absent = fit (default); "0" = full. */
 if(localStorage.getItem("splashDashFitMode")==="0")document.documentElement.classList.add("full");
+/* Restore the persisted per-card collapse state (t_d9b79b36) to <html>
+   BEFORE the body paints, same pre-paint pattern as the Fit toggle above:
+   one key holds a JSON map cardId→collapsed; each collapsed card becomes a
+   `col-<cardId>` class on <html>, which hides the card body and flips its
+   chevron in CSS. Restoring via classes (not per-element JS after load)
+   means a reload in any collapsed state shows no reflow/expand flash, in
+   Fit or Full mode. Key name must match COLLAPSE_KEY in app.js. */
+try{
+  var __c=JSON.parse(localStorage.getItem("splashDashCollapsed")||"null");
+  // Only set classes for card ids that exist in the DOM, so a stale map
+  // (after a dashboard change) can't add meaningless classes.
+  var __ids={livePanel:1,counters:1,memPanel:1,histPanel:1,logwrap:1};
+  if(__c)for(var __k in __c)if(__c[__k]&&__ids[__k])document.documentElement.classList.add("col-"+__k);
+}catch(e){}
 </script>
 </head>
 <body>
@@ -205,33 +273,42 @@ if(localStorage.getItem("splashDashFitMode")==="0")document.documentElement.clas
   hist: samples since load/reset</span></div>
 <main class="main">
   <div class="col">
-    <div class="panel" id="livePanel"><h3>Live state <span class="tag">scheduler + batch</span></h3>
+    <div class="panel" id="livePanel"><h3>Live state <span class="tag">scheduler + batch</span><span class="cvr" aria-hidden="true">▾</span></h3>
+      <div class="pbody">
       <table class="t" id="schedT"></table>
       <h3 style="margin-top:8px">Current decode batch</h3>
       <table class="t" id="dbatchT"></table>
+      </div>
     </div>
-    <div class="panel" id="counters"><h3>Counters <span class="tag">engine lifetime</span></h3>
+    <div class="panel" id="counters"><h3>Counters <span class="tag">engine lifetime</span><span class="cvr" aria-hidden="true">▾</span></h3>
+      <div class="pbody">
       <table class="t" id="cntT"></table>
       <details class="raw"><summary>raw /status JSON (debug)</summary><pre id="rawPre"></pre></details>
+      </div>
     </div>
   </div>
   <div class="col">
-    <div class="panel" id="memPanel"><h3>Memory <span class="tag" id="memTag"></span></h3>
+    <div class="panel" id="memPanel"><h3>Memory <span class="tag" id="memTag"></span><span class="cvr" aria-hidden="true">▾</span></h3>
+      <div class="pbody">
       <div id="memLine"></div>
       <div id="memBarWrap"><div id="memBarFill"></div></div>
       <table class="t" id="kvT"></table>
       <table class="t" id="admT" style="margin-top:6px"></table>
+      </div>
     </div>
-    <div class="panel" id="histPanel"><h3>Latency histograms <span class="tag">adaptive scale · client-diffed</span></h3>
+    <div class="panel" id="histPanel"><h3>Latency histograms <span class="tag">adaptive scale · client-diffed</span><span class="cvr" aria-hidden="true">▾</span></h3>
+      <div class="pbody">
       <div id="histBox"></div>
+      </div>
     </div>
   </div>
 </main>
-<section class="logwrap">
+<section class="logwrap" id="logwrap">
   <div class="lttl">Log stream <span class="tag">tail -f · splash.{out,err}.log</span>
     <span class="spacer"></span>
     <span id="sseState">connecting…</span>
     <button class="ctl" id="btnPause" title="toggle auto-follow (p)">⏸ pause</button>
+    <span class="cvr" aria-hidden="true">▾</span>
   </div>
   <div id="log"></div>
   <button id="pauseChip">⏸ paused</button>

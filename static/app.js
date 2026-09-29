@@ -25,6 +25,59 @@ function setFitMode(mode) {
   if (tgl) tgl.checked = mode === "fit";
 }
 
+/* ---------------- collapsible panels (t_d9b79b36) ----------------
+ * Each of the five cards (livePanel, counters, memPanel, histPanel,
+ * logwrap) collapses to its title bar; clicking the title bar toggles it
+ * back. The five cards are independent of each other AND of Fit/Full mode
+ * — collapsing works in both and, in Fit mode, a collapsed card simply
+ * contributes no content height, so the flex siblings absorb its space.
+ *
+ * State lives in TWO representations kept in sync:
+ *   1. `col-<cardId>` classes on <html> — the single source of truth the
+ *      CSS reads (hides the card body, rotates the chevron). The <head>
+ *      script in index.html applies the persisted classes BEFORE first
+ *      paint, so a reload restores the layout with no reflow flash — the
+ *      same pre-paint pattern as the Fit toggle.
+ *   2. one localStorage JSON map {cardId: collapsedBool} under COLLAPSE_KEY
+ *      — persisted on every toggle so the choice survives reloads.
+ *
+ * Data flow never stops while collapsed: renderAll() keeps writing every
+ * poll into the hidden DOM (display:none panels still get updated —
+ * innerHTML/textContent assignment doesn't require visibility), so a
+ * re-expanded card shows the LATEST poll's values the moment it appears;
+ * no re-render on expand is needed for the four data panels. The Log
+ * Stream is the one exception — its scroll-follow state machine can't just
+ * "keep rendering into hidden DOM" (see expandCard + the scroll guard in
+ * init below).
+ *
+ * A panel's TITLE BAR keeps rendering while collapsed (it stays in the
+ * layout) — including any live summary span it already carried: Memory's
+ * title bar shows the #memTag "peak … GiB" value updated every poll, and
+ * the log title bar keeps its SSE state text + pause button. */
+const COLLAPSE_KEY = "splashDashCollapsed";   // must match index.html head script
+const CARD_IDS = ["livePanel", "counters", "memPanel", "histPanel", "logwrap"];
+function collapseMap() {
+  let m = {};
+  try { m = JSON.parse(localStorage.getItem(COLLAPSE_KEY)) || {}; } catch (e) { m = {}; }
+  return m;
+}
+function saveCollapse(m) { localStorage.setItem(COLLAPSE_KEY, JSON.stringify(m)); }
+function isCollapsed(cardId) { return document.documentElement.classList.contains("col-" + cardId); }
+function setCollapsed(cardId, col) {
+  // The `col-<cardId>` class on <html> is the SOLE state the CSS reads
+  // (index.html keys body-hide, flex-release, and chevron off it — and the
+  // <head> script can set html classes pre-body for a flash-free restore,
+  // so no per-element class is needed or kept in sync).
+  // NB: the log scroll-guard timestamp (S._collapseGuardAt) is anchored by
+  // the logwrap click handler, NOT here — only logwrap transitions reflow
+  // #log. Anchoring on every card would make, e.g., a Counters collapse
+  // suppress a real user scroll of the log up to 50 ms later.
+  document.documentElement.classList.toggle("col-" + cardId, col);
+  const m = collapseMap();
+  if (col) m[cardId] = true; else delete m[cardId];
+  saveCollapse(m);
+}
+
 const S = {
   status: null,        // last good /status payload
   engine: "unknown",   // unknown | ok | down | auth
@@ -42,6 +95,12 @@ const S = {
   paused: false,       // manual pause (button / "p")
   newLines: 0,         // lines added while not at bottom
   logBuf: [],
+  _collapseGuardAt: 0, // last collapse/expand transition (Date.now()) — anchors
+                       // the 50 ms scroll-event guard window in init()
+  _logScrollAtCollapse: 0, // #log.scrollTop saved on the collapse click — while
+                           // hidden, display:none zeroes it, so expandCard()
+                           // restores the user's pre-collapse reading position
+                           // from here (a deliberate pause must survive)
 };
 
 /* ---------------- formatting helpers ---------------- */
@@ -742,6 +801,10 @@ function insertDivider(text, cls) {
   capLog();
 }
 
+// Collapsible-panels (t_d9b79b36): the only change to the base append path
+// is the isCollapsed() guard below — every other behaviour (per-line append,
+// capLog, the isAtBottom pin, the "N new lines" chip) is unchanged from the
+// proven production code.
 function appendLog(item) {
   const log = $("log");
   if (item.type === "rotation") {
@@ -752,6 +815,24 @@ function appendLog(item) {
     log.appendChild(renderLine(item.line || ""));
   }
   capLog();
+  // Only a genuinely COLLAPSED pane is special-cased: it is display:none, so
+  // it has no reading position to preserve and a pin would be a no-op. We
+  // never touch the chip for an unpaused collapsed pane (it reads "at bottom"
+  // by construction), but a DELIBERATE pause is still honest — lines arriving
+  // while paused are genuinely unread, so they keep counting for the chip.
+  //
+  // Note the guard is isCollapsed() ONLY, not `|| clientHeight === 0`:
+  // a pane that is EXPANDED but not yet laid out (the first ~frames of the
+  // initial tail:200 seed, before the browser gives it a clientHeight) MUST
+  // fall through to the normal path below. isAtBottom() reports "at bottom"
+  // for a zero-geometry pane, so the normal path pins (a no-op on zero
+  // geometry) and keeps newLines at 0 — exactly the pre-collapse production
+  // behaviour. An early `return` on clientHeight===0 is what let a fresh load
+  // accumulate a spurious "N new lines" chip while the engine was idle.
+  if (isCollapsed("logwrap")) {
+    if (S.paused) { S.newLines++; updateChip(); }
+    return;
+  }
   const atBottom = isAtBottom();
   if (atBottom && !S.paused) {
     log.scrollTop = log.scrollHeight;
@@ -764,6 +845,20 @@ function appendLog(item) {
 
 function isAtBottom() {
   const log = $("log");
+  // A pane that has no geometry yet (clientHeight 0 — pre-layout on a fresh
+  // load, or hidden) is by INTENT following the tail: it has no reading
+  // position to preserve, so we report "at bottom". The one consequence is
+  // that a per-line pin (scrollTop = scrollHeight) is a no-op on zero
+  // geometry, but that is exactly right — the pane is meant to be at the
+  // tail, and it settles there the instant layout gives it a height.
+  // The bare formula ALREADY returns true in the zero-geometry case
+  // (0 - 0 - 0 = 0 < 24), so this guard exists to make the intent explicit
+  // and to protect the callers (appendLog's pin, the scroll listener, and
+  // updateChip's "not at bottom" branch) from any future change to the
+  // 24 px tolerance: a zero-geometry pane must always read "at bottom".
+  // That is what keeps a fresh load and a collapsed→expand round trip free
+  // of the spurious "N new lines" chip while the engine is idle.
+  if (log.clientHeight === 0) return true;
   return log.scrollHeight - log.scrollTop - log.clientHeight < 24;
 }
 
@@ -800,7 +895,23 @@ function resumeLog() {
   $("btnPause").textContent = "⏸ pause";
 }
 
-/* ---------------- SSE ---------------- */
+/* ---------------- SSE ----------------
+ * Collapsible-panels note (t_d9b79b36): this function is deliberately the
+ * PROVEN base behaviour (per-line append + ping keep-alive). The Log Stream
+ * card can be collapsed, but collapsing is a pure display-layer concern —
+ * it never closes the EventSource, and the tail-follow state machine below
+ * keeps running into the (hidden) #log. The one interaction the collapse
+ * needs is handled at the edges, NOT here:
+ *   - appendLog() skips its scroll-pin / chip logic for a collapsed pane
+ *   - the #log scroll listener ignores events around a collapse/expand
+ *   - expandCard() re-syncs the view when the pane re-appears
+ * We did NOT re-architect the seed replay into a batched flush: the
+ * EventSource 'open' event fires when the HTTP connection establishes,
+ * BEFORE the ?since=tail:200 frames are parsed, so a flush-on-open is a
+ * no-op, and batch + pane-clear on the reconnect path clobbered the user's
+ * reading position and re-triggered the pre-layout "N new lines" chip on a
+ * reconnecting client. The base per-line path pins reliably and is what
+ * production runs, so it is the correct baseline to preserve. */
 function openLogStream() {
   const es = new EventSource("/api/log?since=tail:200");
   es.addEventListener("open", () => { $("sseState").textContent = "live"; });
@@ -825,7 +936,33 @@ function openLogStream() {
 /* ---------------- init ---------------- */
 function init() {
   const log = $("log");
+  // Scroll-follow state machine — the ONE scroll listener on #log. The
+  // collapse/expand transitions change #log's clientHeight (height ↔ 0),
+  // which emits spurious scroll events whose isAtBottom() result is
+  // meaningless (hidden: reads "far from bottom"; expand: reads the stale
+  // pre-transition position). Left unguarded, a reflow event would (a)
+  // flip a tail-following pane into "1 new line" paused state, or (b)
+  // re-fire resumeLog() on a deliberately paused pane — both artifacts of
+  // the hide/show, not of the user. Guard: ignore scroll events that fire
+  // within 50 ms of a collapse/expand transition (a layout reflow lands
+  // well inside that; nobody can meaningfully scroll a hidden pane, and a
+  // real user scroll right after the click is harmless to defer by ≤50 ms).
+  // After the window, normal follow/pause logic applies.
   log.addEventListener("scroll", () => {
+    // Never trust scroll events around a collapse/expand transition. While
+    // the pane is hidden it reports zero geometry (isAtBottom() reads "at
+    // bottom" — which would re-fire resumeLog() on a deliberately paused
+    // pane), and on re-appear the browser re-applies the retained scroll
+    // offset, which can emit an event with a stale isAtBottom() result.
+    // Both are artifacts of the hide/show, not of the user. Ignore scroll
+    // events while the pane is hidden, and any within the 50 ms guard
+    // window after a transition (a reflow lands well inside it; nobody can
+    // meaningfully scroll a hidden pane, and a real user scroll right after
+    // the click is harmless to defer by ≤50 ms).
+    if (isCollapsed("logwrap")) return;
+    if (Date.now() - (S._collapseGuardAt || 0) < 50) {
+      return;
+    }
     if (isAtBottom()) {
       S.newLines = 0;
       if (S.paused) resumeLog();
@@ -833,7 +970,7 @@ function init() {
       S.newLines = Math.max(S.newLines, 1);
       updateChip();
     }
-  });
+  }, { passive: true });
   $("pauseChip").addEventListener("click", resumeLog);
   $("btnPause").addEventListener("click", () => {
     if (S.paused) { resumeLog(); }
@@ -849,6 +986,41 @@ function init() {
       $("btnPause").click();
     }
   });
+  // Collapsible panels (t_d9b79b36): the whole title bar is the hit target
+  // for every card; the chevron is a pure-CSS indicator driven by the
+  // `col-<id>` class on <html> (see COLLAPSE_KEY above). The head script
+  // already restored the persisted collapse classes pre-paint, so no sync
+  // pass is needed here.
+  for (const cardId of CARD_IDS) {
+    const card = $(cardId);
+    if (!card) continue;
+    const bar = cardId === "logwrap" ? card.querySelector(".lttl") : card.querySelector("h3");
+    if (!bar) continue;
+    bar.addEventListener("click", (e) => {
+      // The log title bar contains the ⏸ pause button — its clicks must
+      // NOT toggle the panel.
+      if (cardId === "logwrap" && e.target.closest("#btnPause")) return;
+      const next = !isCollapsed(cardId);
+      // Only logwrap transitions reflow #log (clientHeight height ↔ 0), so
+      // only they need the scroll-guard window (see init's scroll listener).
+      // Save the reading position BEFORE the collapse zeroes it —
+      // expandCard() restores it when a deliberate pause round-trips.
+      if (cardId === "logwrap") {
+        S._collapseGuardAt = Date.now();
+        if (next) {
+          // Capture the pane's PRE-collapse state while it still has real
+          // geometry (the collapse below zeroes clientHeight): expandCard()
+          // restores from these — the hidden pane's own scroll state is
+          // meaningless (a display:none box reports 0/0).
+          S._wasAtBottomAtCollapse =
+            $("log").scrollHeight - $("log").scrollTop - $("log").clientHeight < 24;
+          S._logScrollAtCollapse = $("log").scrollTop;
+        }
+      }
+      setCollapsed(cardId, next);
+      if (cardId === "logwrap" && !next) expandCard(cardId);
+    });
+  }
   // Fit-on-screen toggle (checked = fit mode = default). The head script in
   // index.html already applied the persisted mode to <html> pre-paint; here
   // we sync the checkbox and persist live changes.
@@ -860,5 +1032,58 @@ function init() {
   openLogStream();
   pollStatus();
   setInterval(pollStatus, 5000);
+}
+
+/* Re-sync the log pane's scroll + tail-follow state after its COLLAPSED→
+ * expanded transition: the pane just got a clientHeight again, so a stale
+ * scrollTop may no longer mean what it did while hidden. The task's rule:
+ * if the user had deliberately paused before collapsing, restore their old
+ * scroll position (and keep the paused state); otherwise they were
+ * tail-following — snap to the newest line. S.paused is never changed: a
+ * user's deliberate pause survives the round trip. */
+function expandCard(cardId) {
+  if (cardId !== "logwrap") return;
+  const log = $("log");
+  // The restore MUST run on the next frame, after layout: the click handler
+  // flips the class (pane hidden→visible) and this function is called
+  // synchronously from it, so in this same turn #log's freshly-restored
+  // clientHeight may not be resolvable yet — any scrollTop read/write against
+  // it is unreliable, so defer until the frame where layout has happened.
+  // (The browser retains the element's pre-hide scrollTop, but its meaning
+  // against the new height is undefined — which is why we restore from the
+  // values captured at the collapse click instead.) The user's
+  // pre-collapse reading position and bottom-ness were captured at the
+  // collapse click (S._logScrollAtCollapse / S._wasAtBottomAtCollapse), so
+  // the restore is fully determined once the pane has its real size.
+  // The click handler anchored the 50 ms scroll-guard window at the
+  // transition (see init's scroll listener); the rAF below re-anchors it
+  // around the restore's own reflow event, so spurious scroll events from
+  // the hide/show round trip are suppressed (nobody can meaningfully scroll
+  // a pane mid-transition, and a real user scroll right after the click is
+  // harmless to defer by ≤50 ms).
+  S._collapseGuardAt = Date.now();
+  requestAnimationFrame(() => {
+    if (isCollapsed("logwrap")) return;   // collapsed again meanwhile
+    // S.paused is NEVER changed here: a deliberate pause survives the
+    // round trip. Only the scroll position is restored:
+    if (S.paused && !S._wasAtBottomAtCollapse) {
+      // Deliberate pause at a real reading position (incl. the top):
+      // restore exactly where they were reading — and their chip (N new
+      // lines counted while hidden) stays, still honest.
+      log.scrollTop = S._logScrollAtCollapse || 0;
+    } else {
+      // Tail-following, or deliberately paused at the very bottom: the
+      // user's pre-collapse "position" IS the tail — snap to the newest
+      // line (a follow-mode user was pinned there every frame; a bottom-
+      // paused user was looking at it). The chip updates from the real
+      // post-restore position.
+      log.scrollTop = log.scrollHeight;
+    }
+    // S.newLines is intentionally NOT zeroed: if the user was paused away
+    // from the bottom, lines arrived while hidden and the chip must show
+    // the true unread count on re-appear (a tail-following user has
+    // newLines 0 by construction, so nothing changes for them).
+    updateChip();
+  });
 }
 document.addEventListener("DOMContentLoaded", init);
