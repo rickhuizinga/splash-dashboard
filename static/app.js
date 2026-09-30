@@ -345,7 +345,6 @@ function renderLive(p) {
     ["queued", fmtInt(sc.queued), sc.queued ? "warn" : ""],
     ["waiting_prefix", fmtInt(sc.waiting_prefix)],
     ["waiting_resources", fmtInt(sc.waiting_resources)],
-    ["terminal", fmtInt(sc.terminal)],
     ["decode batches by width",
      `b1 ${fmtInt(sc.decode_batches_by_width && sc.decode_batches_by_width.b1)} · ` +
      `b2 ${fmtInt(sc.decode_batches_by_width && sc.decode_batches_by_width.b2)} · ` +
