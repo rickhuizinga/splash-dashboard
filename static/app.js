@@ -106,6 +106,8 @@ const S = {
 /* ---------------- formatting helpers ---------------- */
 function fmtInt(n) { return (n == null) ? "—" : Math.round(n).toLocaleString("en-US"); }
 function fmtGiB(b) { return (b == null) ? "—" : (b / GIB).toFixed(1) + " GiB"; }
+function fmtMiB(b) { return (b == null) ? "—" : (b / (GIB / 1024)).toFixed(2) + " MiB"; }
+function fmtMtok(n) { return (n == null) ? "—" : (n / 1e6).toFixed(2) + "M"; }
 function fmtPct(x, dp = 1) { return (x == null) ? "—" : (x * 100).toFixed(dp) + "%"; }
 function fmtTps(x) { return (x == null) ? "—" : x.toFixed(1) + " tok/s"; }
 function humanMs(ms) {
@@ -181,7 +183,8 @@ async function pollStatus() {
                                         // is zero and no scale can be derived)
     S.lastEdgeKeys = {};
     for (const k of ["ttft", "itl", "queue"]) {
-      const secName = k === "itl" ? "output_interval" : k === "queue" ? "native_queue" : "ttft";
+      // Schema 6 (Splash 1.2.0): /status.latency.ttft renamed to latency.http_ttft.
+      const secName = k === "itl" ? "output_interval" : k === "queue" ? "native_queue" : "http_ttft";
       const ec = edgeCum(st.latency && st.latency[secName]);
       if (!ec) { S.histBase[k] = null; continue; }
       S.histBase[k] = ec;               // baseline = what the engine already has
@@ -268,7 +271,13 @@ function renderAll(st) {
 
 function renderHeader(p) {
   const ins = p.instance || {};
-  if (ins.model) $("hModel").textContent = "— " + shortModel(ins.model);
+  // Schema 6 model names are long (e.g. "unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M").
+  // Show the org-stripped form in the header, carry the FULL name in a hover
+  // tooltip so nothing is silently lost (the engine exposes no separate alias).
+  if (ins.model) {
+    $("hModel").textContent = "— " + shortModel(ins.model);
+    $("hModel").title = ins.model;
+  }
   if (ins.port != null) $("hPort").textContent = ins.port;
   if (ins.pid != null) $("hPid").textContent = ins.pid;
   $("hSchema").textContent = "v" + (p.schema_version != null ? p.schema_version : "—");
@@ -320,7 +329,15 @@ function renderKpis(p) {
     `${fmtInt(m.accepted_draft_tokens)}/${fmtInt(m.drafted_tokens)} drafted` : "") +
     (m.metal_failures ? ` · ${m.metal_failures} metal fails` : "");
   $("vCache").textContent = c.hit_rate != null ? fmtPct(c.hit_rate) : "—";
-  $("sCache").textContent = `${fmtInt(c.hits)}/${fmtInt(c.lookups)} lookups · ` +
+  // Schema 6 (Splash 1.2.0): the derived cache.lookups counter was removed
+  // from /status. The engine's hit_rate is computed on hits / (hits +
+  // cold_misses) — verified against the live payload (2026-10-03):
+  // 245 / (245 + 4) = 0.983935… == cache.hit_rate exactly. The denominator
+  // is therefore recomputed from those two live fields and the ratio shown
+  // here is exactly the engine's own hit-rate basis.
+  const cLookups = (c.hits != null || c.cold_misses != null)
+    ? (c.hits || 0) + (c.cold_misses || 0) : null;
+  $("sCache").textContent = `${fmtInt(c.hits)}/${fmtInt(cLookups)} lookups · ` +
     `${fmtInt(c.kv_hit_tokens)} tok reused`;
   const tt = m.ttft_ms || {};
   $("vTtft").textContent = tt.p50 != null ? humanMs(tt.p50) : "—";
@@ -387,11 +404,53 @@ function renderMemory(p) {
   fill.style.width = pct.toFixed(1) + "%";
   fill.className = cls;
   $("memTag").textContent = `peak ${(a.peak_bytes / GIB).toFixed(1)} GiB`;
+
+  // ---- KV pool (schema 6 / Splash 1.2.0, dynamic extents) --------------
+  // 1.1.0 pre-allocated a fixed KV pool (pages_total / pages_resident); 1.2.0
+  // replaced it with on-demand extents: KV grows in kv_extent_pages steps and
+  // empty extents are released back to macOS. The pool snapshot (kv.*) now
+  // reports pages_allocated (allocated extents), pages_active (held by
+  // requests), pages_cache (prefix-cached) and pages_free (allocated but
+  // idle). There is NO pool "total" — the ceiling is the memory plan's
+  // budgeted KV capacity (memory_plan.budget). The meaningful bar is therefore
+  // allocated / budgeted-capacity, not the old resident/total.
+  const budget = (p.memory_plan && p.memory_plan.budget) || {};
+  const kvCapPages = budget.kv_capacity_pages, kvCapTokens = budget.kv_capacity_tokens;
+  const kvCapBytes = budget.kv_capacity_bytes;
+  const kvAlloc = kv.pages_allocated;
+  const kvPct = (kvAlloc != null && kvCapPages) ? Math.min(100, kvAlloc / kvCapPages * 100) : 0;
+  const kvBar = $("kvBarFill");
+  if (kvBar) {
+    kvBar.style.width = kvPct.toFixed(1) + "%";
+    kvBar.className = kvPct > 90 ? "bad" : kvPct > 70 ? "warn" : "";
+  }
+  const kvLine = $("kvLine");
+  if (kvLine) {
+    kvLine.innerHTML = kvCapPages
+      ? `KV pool <b>${fmtInt(kvAlloc)}</b> / ${fmtInt(kvCapPages)} pages ` +
+        `(<b>${kvPct.toFixed(0)}%</b> of budget) · extents ` +
+        `${fmtInt(kv.extent_allocations)} alloc · ${fmtInt(kv.extent_releases)} rel (lifetime)`
+      : "KV pool —";
+  }
   $("kvT").innerHTML = rows([
-    ["KV pages", `${fmtInt(kv.pages_active)} active · ${fmtInt(kv.pages_cache)} cache · ` +
-      `${fmtInt(kv.pages_free)} free (of ${fmtInt(kv.pages_total)})`],
-    ["KV cache bytes", fmtGiB(kv.cache_bytes) + " · backing " + fmtGiB(kv.resident_backing_bytes)],
-    ["reclaim", `pending unmaps ${fmtInt(kv.pending_unmaps)} · completed ${fmtInt(kv.unmaps_completed)}`],
+    ["KV capacity", kvCapPages
+      ? `${fmtInt(kvCapPages)} pg · ${fmtMtok(kvCapTokens)} tok` +
+        (kvCapBytes != null ? ` · ${fmtGiB(kvCapBytes)}` : "")
+      : "—"],
+    ["page size / extent",
+      (budget.kv_page_bytes != null ? fmtMiB(budget.kv_page_bytes) : "—") +
+      " / " + fmtInt(budget.kv_page_tokens) + " tok" +
+      " · " + fmtInt(budget.kv_extent_pages) + " pg = " +
+      (budget.kv_extent_bytes != null
+        ? (budget.kv_extent_bytes / (GIB / 1024)).toFixed(1) + " MiB" : "—") +
+      " per extent"],
+    // pages_active ⊆ pages_cache ⊆ pages_allocated (live 1.2.0: 5,537 active
+    // within 17,621 cached of 17,664 allocated) — show the raw counters, do
+    // not imply a partition that doesn't exist.
+    ["KV pages", `${fmtInt(kv.pages_active)} active · ${fmtInt(kv.pages_cache)} cached · ` +
+      `${fmtInt(kv.pages_free)} free of ${fmtInt(kvAlloc)} allocated`],
+    ["KV pool bytes", fmtGiB(kv.allocated_bytes) +
+      (kv.reclaimable_bytes ? ` · reclaimable ${fmtGiB(kv.reclaimable_bytes)}` : "")],
     ["governor headroom", fmtGiB(g.headroom_bytes) + " · host " + fmtGiB(g.host_headroom_bytes)],
   ]);
   const ad = p.admission || {};
@@ -628,7 +687,8 @@ function renderHistograms(p) {
   let any = false;
   for (const def of HIST_DEFS) {
     const secName = def.key === "itl" ? "output_interval" :
-      def.key === "queue" ? "native_queue" : "ttft";
+      // Schema 6 (Splash 1.2.0): latency.ttft → latency.http_ttft.
+      def.key === "queue" ? "native_queue" : "http_ttft";
     const sec = p.latency[secName];
     if (!sec || !sec.buckets) continue;
     const cur = edgeCum(sec);
