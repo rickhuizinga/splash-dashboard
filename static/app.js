@@ -91,10 +91,13 @@ const S = {
   lastEdgeKeys: {},    // per-metric key of last rendered native bucket edge set
   lastPollAt: null,
   // log pane
-  atBottom: true,
+  atNewest: true,     // (informational) pane is at the newest end
   paused: false,       // manual pause (button / "p")
-  newLines: 0,         // lines added while not at bottom
+  newLines: 0,         // lines added while not at newest
   logBuf: [],
+  _logSettled: false,  // t_7012e88c: true once the initial tail:200 backfill
+                       // burst has drained; while false, appendLog() pins to
+                       // the newest line so the first paint is newest-on-top.
   _collapseGuardAt: 0, // last collapse/expand transition (Date.now()) — anchors
                        // the 50 ms scroll-event guard window in init()
   _logScrollAtCollapse: 0, // #log.scrollTop saved on the collapse click — while
@@ -801,9 +804,22 @@ function renderHistograms(p) {
 }
 
 /* ---------------- log pane ----------------
- * tail -f behavior: newest at bottom, auto-follows while the user is at the
- * bottom; any scroll up pauses follow and shows a "N new lines" chip; clicking
- * the chip (or the pause button) resumes. Buffer capped at 5,000 nodes.
+ * Newest-on-top (t_7012e88c, Rick's Option 3): the pane renders newest at the
+ * TOP via #log's `flex-direction: column-reverse` — a pure CSS flip. DOM order
+ * and the append-at-end pipeline are UNCHANGED: lines still append to the end
+ * of #log, and that end is the visual TOP.
+ *
+ * IMPORTANT — the scroll axis is NEGATIVE under column-reverse (verified in
+ * Chromium against this exact structure, test/): scrollTop 0 is the OLDEST end
+ * of the content; scrollTop -(scrollHeight - clientHeight) is the NEWEST end.
+ * Every pin and predicate below is written for that axis:
+ *   - pin to newest:        log.scrollTop = -(log.scrollHeight - log.clientHeight)
+ *   - "at newest" test:     log.scrollTop + (log.scrollHeight - log.clientHeight) < 24
+ *   - user scrolling to read history moves scrollTop toward 0 (the oldest end);
+ *     scrolling back to the newest line moves it back to the negative min.
+ * Buffer capped at 5,000 nodes (capLog still removes firstElementChild = the
+ * OLDEST line, which column-reverse renders at the BOTTOM — DOM removal is
+ * unchanged).
  *
  * Level coloring (spec): Ready=green Done=default Cancelled=yellow
  * Error=red Loading=blue; anything else dim. Log-line grammar:
@@ -862,10 +878,22 @@ function insertDivider(text, cls) {
 
 // Collapsible-panels (t_d9b79b36): the only change to the base append path
 // is the isCollapsed() guard below — every other behaviour (per-line append,
-// capLog, the isAtBottom pin, the "N new lines" chip) is unchanged from the
-// proven production code.
+// capLog, the isAtNewest pin, the "N new lines" chip) is unchanged from the
+// proven production code. (t_7012e88c added the force-pin below for the
+// initial backfill's first paint.)
 function appendLog(item) {
   const log = $("log");
+  // t_7012e88c AC-6: divider items (rotation/restart) are TALLER than the
+  // 24px "at newest" tolerance, so the insert itself grows #log past the
+  // current pin — isAtNewest() read AFTER the insert would report a
+  // tail-following user as "scrolled away", skipping the re-pin and leaving
+  // the divider ~27px clipped above the viewport top with auto-follow dead
+  // until the next manual scroll (verified in Chromium: divider ≈ 29px).
+  // Capture the following state BEFORE the insert. A deliberate pause is
+  // still respected by the existing `&& !S.paused` below: a divider that
+  // lands on a paused pane counts as an unread line, like any other append.
+  const dividerItem = (item.type === "rotation" || item.type === "restart");
+  const atNewestBeforeInsert = dividerItem ? isAtNewest() : false;
   if (item.type === "rotation") {
     insertDivider(`↻ log rotated (${esc(item.file || "log")}) — stream continued`, "rot");
   } else if (item.type === "restart") {
@@ -876,14 +904,14 @@ function appendLog(item) {
   capLog();
   // Only a genuinely COLLAPSED pane is special-cased: it is display:none, so
   // it has no reading position to preserve and a pin would be a no-op. We
-  // never touch the chip for an unpaused collapsed pane (it reads "at bottom"
+  // never touch the chip for an unpaused collapsed pane (it reads "at newest"
   // by construction), but a DELIBERATE pause is still honest — lines arriving
   // while paused are genuinely unread, so they keep counting for the chip.
   //
   // Note the guard is isCollapsed() ONLY, not `|| clientHeight === 0`:
   // a pane that is EXPANDED but not yet laid out (the first ~frames of the
   // initial tail:200 seed, before the browser gives it a clientHeight) MUST
-  // fall through to the normal path below. isAtBottom() reports "at bottom"
+  // fall through to the normal path below. isAtNewest() reports "at newest"
   // for a zero-geometry pane, so the normal path pins (a no-op on zero
   // geometry) and keeps newLines at 0 — exactly the pre-collapse production
   // behaviour. An early `return` on clientHeight===0 is what let a fresh load
@@ -892,33 +920,54 @@ function appendLog(item) {
     if (S.paused) { S.newLines++; updateChip(); }
     return;
   }
-  const atBottom = isAtBottom();
-  if (atBottom && !S.paused) {
-    log.scrollTop = log.scrollHeight;
-    S.newLines = 0;
+  const atNewest = atNewestBeforeInsert || isAtNewest();
+  // t_7012e88c AC-4: the initial tail:200 backfill arrives as a synchronous
+  // burst. Under column-reverse the browser settles the pane at scrollTop 0
+  // (the OLDEST end) — NOT the newest end — so the first paint would be
+  // oldest-on-top. While the burst is still draining (S._logSettled is
+  // false) we pin to newest on every appended line; the last line of the
+  // burst lands newest-on-top. After the burst we flip S._logSettled and
+  // hand control to the user (a deliberate scroll to read history is
+  // respected, no more forced pin). The settle window is short (see
+  // openLogStream's timeout) and only affects the very first paint.
+  const forcePin = !S._logSettled;
+  if (atNewest && !S.paused || forcePin) {
+    pinToNewest();
+    if (forcePin) S.newLines = 0;
   } else {
     S.newLines++;
     updateChip();
   }
 }
 
-function isAtBottom() {
+// Pin #log so the NEWEST line sits at the top of the viewport. Under
+// column-reverse that is the NEGATIVE min of the scroll range (verified in
+// Chromium: scrollTop 0 = oldest end, -(scrollHeight-clientHeight) = newest
+// end). A no-op when the content fits the pane (range is 0).
+function pinToNewest() {
   const log = $("log");
-  // A pane that has no geometry yet (clientHeight 0 — pre-layout on a fresh
-  // load, or hidden) is by INTENT following the tail: it has no reading
-  // position to preserve, so we report "at bottom". The one consequence is
-  // that a per-line pin (scrollTop = scrollHeight) is a no-op on zero
-  // geometry, but that is exactly right — the pane is meant to be at the
-  // tail, and it settles there the instant layout gives it a height.
-  // The bare formula ALREADY returns true in the zero-geometry case
-  // (0 - 0 - 0 = 0 < 24), so this guard exists to make the intent explicit
-  // and to protect the callers (appendLog's pin, the scroll listener, and
-  // updateChip's "not at bottom" branch) from any future change to the
-  // 24 px tolerance: a zero-geometry pane must always read "at bottom".
-  // That is what keeps a fresh load and a collapsed→expand round trip free
-  // of the spurious "N new lines" chip while the engine is idle.
+  log.scrollTop = -(log.scrollHeight - log.clientHeight);
+}
+
+function isAtNewest() {
+  const log = $("log");
+  // t_7012e88c: under column-reverse the "newest end" is the NEGATIVE min of
+  // the scroll range, not the bottom. A pane with no geometry yet
+  // (clientHeight 0 — pre-layout on a fresh load, or hidden) is by INTENT
+  // following the newest line: it has no reading position to preserve, so we
+  // report "at newest". The bare formula already returns true in the
+  // zero-geometry case (0 + (0 - 0) = 0 < 24), so this guard makes the intent
+  // explicit and protects the callers (appendLog's pin, the scroll listener,
+  // and updateChip's "not at newest" branch) from any future change to the
+  // 24 px tolerance: a zero-geometry pane must always read "at newest".
+  // That is what keeps a fresh load and a collapsed→expand round trip free of
+  // the spurious "N new lines" chip while the engine is idle.
   if (log.clientHeight === 0) return true;
-  return log.scrollHeight - log.scrollTop - log.clientHeight < 24;
+  // distance from the newest end = how far the top of the content sits below
+  // the newest line; small (<=24px) means the newest line is at the viewport
+  // top. Equivalent to (range + scrollTop) where range = scrollHeight -
+  // clientHeight and scrollTop ranges over [-range, 0].
+  return log.scrollTop + (log.scrollHeight - log.clientHeight) < 24;
 }
 
 function capLog() {
@@ -935,9 +984,11 @@ function capLog() {
 
 function updateChip() {
   const chip = $("pauseChip");
-  const shouldShow = (S.paused || !isAtBottom()) && S.newLines > 0;
+  const shouldShow = (S.paused || !isAtNewest()) && S.newLines > 0;
   if (shouldShow) {
-    chip.textContent = `⏸ paused — ${S.newLines} new line${S.newLines > 1 ? "s" : ""} ↓`;
+    // t_7012e88c: new lines now arrive at the TOP, so a paused/scrolled user
+    // has unread lines ABOVE the viewport — the chip arrow flips to ↑.
+    chip.textContent = `⏸ paused — ${S.newLines} new line${S.newLines > 1 ? "s" : ""} ↑`;
     chip.classList.add("show");
   } else {
     chip.classList.remove("show");
@@ -946,8 +997,7 @@ function updateChip() {
 
 function resumeLog() {
   S.paused = false;
-  const log = $("log");
-  log.scrollTop = log.scrollHeight;
+  pinToNewest();   // t_7012e88c: newest end = negative min, not scrollHeight
   S.newLines = 0;
   updateChip();
   $("btnPause").classList.remove("active");
@@ -974,6 +1024,16 @@ function resumeLog() {
 function openLogStream() {
   const es = new EventSource("/api/log?since=tail:200");
   es.addEventListener("open", () => { $("sseState").textContent = "live"; });
+  // t_7012e88c AC-4: the ?since=tail:200 backfill streams in as a burst of
+  // 'log' events shortly after the connection opens. Until that burst drains,
+  // appendLog() force-pins to the newest line (S._logSettled is false) so the
+  // first paint is newest-on-top even though a synchronous column-reverse
+  // burst would otherwise settle at the oldest end. Flip the flag once the
+  // burst has drained: from then on a deliberate user scroll to read history
+  // is respected and no longer overridden. 400 ms comfortably covers a
+  // 200-line burst on localhost (it arrives in a few ms); the window is a
+  // no-op if the pane already follows the newest line.
+  setTimeout(() => { S._logSettled = true; }, 400);
   es.addEventListener("error", () => {
     $("sseState").textContent = "reconnecting…";
     es.close();
@@ -997,8 +1057,8 @@ function init() {
   const log = $("log");
   // Scroll-follow state machine — the ONE scroll listener on #log. The
   // collapse/expand transitions change #log's clientHeight (height ↔ 0),
-  // which emits spurious scroll events whose isAtBottom() result is
-  // meaningless (hidden: reads "far from bottom"; expand: reads the stale
+  // which emits spurious scroll events whose isAtNewest() result is
+  // meaningless (hidden: reads "at newest" by the zero-geometry rule; expand: reads the stale
   // pre-transition position). Left unguarded, a reflow event would (a)
   // flip a tail-following pane into "1 new line" paused state, or (b)
   // re-fire resumeLog() on a deliberately paused pane — both artifacts of
@@ -1009,10 +1069,10 @@ function init() {
   // After the window, normal follow/pause logic applies.
   log.addEventListener("scroll", () => {
     // Never trust scroll events around a collapse/expand transition. While
-    // the pane is hidden it reports zero geometry (isAtBottom() reads "at
-    // bottom" — which would re-fire resumeLog() on a deliberately paused
+    // the pane is hidden it reports zero geometry (isAtNewest() reads "at
+    // newest" — which would re-fire resumeLog() on a deliberately paused
     // pane), and on re-appear the browser re-applies the retained scroll
-    // offset, which can emit an event with a stale isAtBottom() result.
+    // offset, which can emit an event with a stale isAtNewest() result.
     // Both are artifacts of the hide/show, not of the user. Ignore scroll
     // events while the pane is hidden, and any within the 50 ms guard
     // window after a transition (a reflow lands well inside it; nobody can
@@ -1022,7 +1082,7 @@ function init() {
     if (Date.now() - (S._collapseGuardAt || 0) < 50) {
       return;
     }
-    if (isAtBottom()) {
+    if (isAtNewest()) {
       S.newLines = 0;
       if (S.paused) resumeLog();
     } else {
@@ -1071,8 +1131,11 @@ function init() {
           // geometry (the collapse below zeroes clientHeight): expandCard()
           // restores from these — the hidden pane's own scroll state is
           // meaningless (a display:none box reports 0/0).
-          S._wasAtBottomAtCollapse =
-            $("log").scrollHeight - $("log").scrollTop - $("log").clientHeight < 24;
+          // t_7012e88c: "at newest" is the negative end under column-reverse;
+          // the captured scrollTop (possibly negative) is restored verbatim by
+          // expandCard() — no conversion needed.
+          S._wasAtNewestAtCollapse =
+            $("log").scrollTop + ($("log").scrollHeight - $("log").clientHeight) < 24;
           S._logScrollAtCollapse = $("log").scrollTop;
         }
       }
@@ -1111,8 +1174,8 @@ function expandCard(cardId) {
   // (The browser retains the element's pre-hide scrollTop, but its meaning
   // against the new height is undefined — which is why we restore from the
   // values captured at the collapse click instead.) The user's
-  // pre-collapse reading position and bottom-ness were captured at the
-  // collapse click (S._logScrollAtCollapse / S._wasAtBottomAtCollapse), so
+  // pre-collapse reading position and newest-ness were captured at the
+  // collapse click (S._logScrollAtCollapse / S._wasAtNewestAtCollapse), so
   // the restore is fully determined once the pane has its real size.
   // The click handler anchored the 50 ms scroll-guard window at the
   // transition (see init's scroll listener); the rAF below re-anchors it
@@ -1125,21 +1188,21 @@ function expandCard(cardId) {
     if (isCollapsed("logwrap")) return;   // collapsed again meanwhile
     // S.paused is NEVER changed here: a deliberate pause survives the
     // round trip. Only the scroll position is restored:
-    if (S.paused && !S._wasAtBottomAtCollapse) {
-      // Deliberate pause at a real reading position (incl. the top):
-      // restore exactly where they were reading — and their chip (N new
-      // lines counted while hidden) stays, still honest.
+    if (S.paused && !S._wasAtNewestAtCollapse) {
+      // Deliberate pause at a real reading position (anywhere from mid-history
+      // down to the OLDEST end, scrollTop 0): restore exactly where they were
+      // reading — and their chip (N new lines counted while hidden) stays,
+      // still honest. Under column-reverse the saved scrollTop is a (possibly
+      // negative) value on the [-(range), 0] axis; restore it verbatim.
       log.scrollTop = S._logScrollAtCollapse || 0;
     } else {
-      // Tail-following, or deliberately paused at the very bottom: the
-      // user's pre-collapse "position" IS the tail — snap to the newest
-      // line (a follow-mode user was pinned there every frame; a bottom-
-      // paused user was looking at it). The chip updates from the real
-      // post-restore position.
-      log.scrollTop = log.scrollHeight;
+      // Following the newest line, or deliberately paused right at it: the
+      // user's pre-collapse "position" IS the newest end — snap to the newest
+      // line. The chip updates from the real post-restore position.
+      pinToNewest();
     }
     // S.newLines is intentionally NOT zeroed: if the user was paused away
-    // from the bottom, lines arrived while hidden and the chip must show
+    // from the newest line, lines arrived while hidden and the chip must show
     // the true unread count on re-appear (a tail-following user has
     // newLines 0 by construction, so nothing changes for them).
     updateChip();

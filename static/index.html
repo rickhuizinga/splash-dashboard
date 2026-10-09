@@ -160,7 +160,13 @@ table.t td.v.ok{color:var(--green)}
   letter-spacing:.9px;color:var(--dim);font-weight:600;min-height:32px;
   cursor:pointer;user-select:none}
 .logwrap .lttl .spacer{flex:1}
-#log{flex:1;overflow-y:auto;padding:6px 12px;font-family:var(--mono);font-size:12.5px;
+/* newest-on-top (t_7012e88c, Rick's Option 3): column-reverse flips the VISUAL
+   order only — DOM order and the append-at-end pipeline stay untouched. The
+   browser's scroll axis is NEGATIVE here: scrollTop 0 = OLDEST end,
+   scrollTop -(scrollHeight-clientHeight) = NEWEST end. All pin/predicate logic
+   in app.js is written for that axis (verified in Chromium, see test/). */
+#log{display:flex;flex-direction:column-reverse;flex:1;overflow-y:auto;
+  padding:6px 12px;font-family:var(--mono);font-size:12.5px;
   scrollbar-width:thin;scrollbar-color:var(--border) transparent}
 #log .l{white-space:pre-wrap;word-break:break-word;padding:0 4px;border-radius:3px;
   display:flex;flex-wrap:wrap;align-items:baseline;gap:6px}
@@ -221,10 +227,10 @@ html.col-memPanel #memPanel, html.col-histPanel #histPanel{flex:0 0 auto}
 html.col-logwrap .logwrap{flex:0 0 auto;height:auto;min-height:0;max-height:none}
 /* Collapsed log: hide the body (and the pause chip, which overlays it).
    The SSE stream + buffer keep running into the hidden DOM (see app.js):
-   a display:none #log reports zero geometry, so isAtBottom() reads "at
-   bottom" and clientHeight-0 guards in appendLog pin the tail without
-   counting lines — exactly the task's "treat as was at bottom" rule.
-   expandCard() re-syncs the view when the body re-appears. The title
+   a display:none #log reports zero geometry, so isAtNewest() reads "at
+   newest" and clientHeight-0 guards in appendLog pin the newest line
+   without counting lines — exactly the task's "treat as was at newest"
+   rule. expandCard() re-syncs the view when the body re-appears. The title
    bar alone remains (SSE state text + pause button stay live). */
 html.col-logwrap #log{display:none}
 html.col-logwrap #pauseChip{display:none}
