@@ -163,11 +163,26 @@ table.t td.v.ok{color:var(--green)}
 /* newest-on-top (t_7012e88c, Rick's Option 3): column-reverse flips the VISUAL
    order only — DOM order and the append-at-end pipeline stay untouched. The
    browser's scroll axis is NEGATIVE here: scrollTop 0 = OLDEST end,
-   scrollTop -(scrollHeight-clientHeight) = NEWEST end. All pin/predicate logic
-   in app.js is written for that axis (verified in Chromium, see test/). */
+   scrollTop -(scrollHeight-clientHeight) = NEWEST end. All pin/predicate
+   logic in app.js is written for that axis (verified in Chromium, see
+   test/). t_9bc8a326 added the oldest-first opt-out below. */
 #log{display:flex;flex-direction:column-reverse;flex:1;overflow-y:auto;
   padding:6px 12px;font-family:var(--mono);font-size:12.5px;
   scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+/* oldest-first (t_9bc8a326): plain column — scrollback convention, newest
+   lines at the BOTTOM. The `logold` class is restored on <html> by the head
+   script BEFORE first paint (persisted choice, no flash) and toggled live by
+   setLogDir(). Scroll axis is POSITIVE here: scrollTop 0 = OLDEST end (the
+   reading start), +(scrollHeight-clientHeight) = NEWEST end at the bottom.
+   app.js's pin/predicate primitives branch on logDir() for both axes
+   (verified in Chromium, test/coord_system2.py). */
+html.logold #log{flex-direction:column}
+/* "Newest first" order toggle in the log title bar (t_9bc8a326) */
+#logOrderWrap{display:inline-flex;align-items:center;gap:5px;font-size:11.5px;
+  color:var(--dim);cursor:pointer;user-select:none;text-transform:none;
+  letter-spacing:0;white-space:nowrap;flex:0 0 auto}
+#logOrderWrap:hover{color:var(--fg)}
+#logOrderWrap input{accent-color:var(--accent);margin:0;cursor:pointer}
 #log .l{white-space:pre-wrap;word-break:break-word;padding:0 4px;border-radius:3px;
   display:flex;flex-wrap:wrap;align-items:baseline;gap:6px}
 #log .l:hover{background:rgba(255,255,255,.04)}
@@ -245,6 +260,13 @@ html.full.col-logwrap .logwrap{min-height:0}
    body paints, so a reload in full mode never flashes fit mode (or vice
    versa). "1"/absent = fit (default); "0" = full. */
 if(localStorage.getItem("splashDashFitMode")==="0")document.documentElement.classList.add("full");
+/* Restore the persisted Log Stream display order (t_9bc8a326) to <html>
+   BEFORE the body paints, same pre-paint pattern as the Fit toggle above:
+   "splashLogOrder" === "old" => oldest-first (plain column, newest lines
+   at the bottom); "new"/absent => newest-first (the column-reverse
+   default in the CSS, so nothing needs restoring). Key name must match
+   LOGDIR_KEY in app.js. */
+if(localStorage.getItem("splashLogOrder")==="old")document.documentElement.classList.add("logold");
 /* Restore the persisted per-card collapse state (t_d9b79b36) to <html>
    BEFORE the body paints, same pre-paint pattern as the Fit toggle above:
    one key holds a JSON map cardId→collapsed; each collapsed card becomes a
@@ -333,6 +355,12 @@ try{
 <section class="logwrap" id="logwrap">
   <div class="lttl">Log stream <span class="tag">tail -f · splash.{out,err}.log</span>
     <span class="spacer"></span>
+    <label id="logOrderWrap" title="Display order for the log stream.
+      Checked (default) = newest-first: newest line on top (tail -f).
+      Unchecked = oldest-first: newest line at the bottom (scrollback).
+      (choice is remembered)">
+      <input type="checkbox" id="logOrderTgl" checked> Newest first
+    </label>
     <span id="sseState">connecting…</span>
     <button class="ctl" id="btnPause" title="toggle auto-follow (p)">⏸ pause</button>
     <span class="cvr" aria-hidden="true">▾</span>

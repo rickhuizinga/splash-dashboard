@@ -56,6 +56,16 @@ function setFitMode(mode) {
  * the log title bar keeps its SSE state text + pause button. */
 const COLLAPSE_KEY = "splashDashCollapsed";   // must match index.html head script
 const CARD_IDS = ["livePanel", "counters", "memPanel", "histPanel", "logwrap"];
+
+/* Log Stream display order (t_9bc8a326). "old" = oldest-first (plain
+ * column, positive scroll axis); "new"/absent = newest-first (the
+ * column-reverse default, negative axis — current behaviour, so existing
+ * users see no change). The <head> script in index.html applies the
+ * persisted `logold` class to <html> BEFORE first paint (no flash); here
+ * we only (re)sync the checkbox and handle live toggling. Key name must
+ * match index.html's head script. */
+const LOGDIR_KEY = "splashLogOrder";
+function logDir() { return localStorage.getItem(LOGDIR_KEY) === "old" ? "old" : "new"; }
 function collapseMap() {
   let m = {};
   try { m = JSON.parse(localStorage.getItem(COLLAPSE_KEY)) || {}; } catch (e) { m = {}; }
@@ -95,11 +105,20 @@ const S = {
   paused: false,       // manual pause (button / "p")
   newLines: 0,         // lines added while not at newest
   logBuf: [],
-  _logSettled: false,  // t_7012e88c: true once the initial tail:200 backfill
-                       // burst has drained; while false, appendLog() pins to
-                       // the newest line so the first paint is newest-on-top.
-  _collapseGuardAt: 0, // last collapse/expand transition (Date.now()) — anchors
-                       // the 50 ms scroll-event guard window in init()
+  _logSettled: false,  // t_7012e88c / t_9bc8a326: true once the initial
+                       // tail:200 backfill burst has drained; while false,
+                       // appendLog() lands the pane at the reading start of
+                       // the current display order and zeroes the chip
+                       // counter (the burst is history, not "new lines"):
+                       // newest-first -> pin to the newest line (the
+                       // t_7012e88c newest-on-top first paint); oldest-first
+                       // -> the natural settle, scrollTop 0 = the oldest end
+                       // at the top.
+  _collapseGuardAt: 0, // last logwrap collapse/expand transition OR display-
+                       // order flip (Date.now()) — anchors the 50 ms
+                       // scroll-event guard window in init() (both are axis /
+                       // geometry transitions whose synthetic scroll event
+                       // must not be misread as a user scroll)
   _logScrollAtCollapse: 0, // #log.scrollTop saved on the collapse click — while
                            // hidden, display:none zeroes it, so expandCard()
                            // restores the user's pre-collapse reading position
@@ -804,22 +823,36 @@ function renderHistograms(p) {
 }
 
 /* ---------------- log pane ----------------
- * Newest-on-top (t_7012e88c, Rick's Option 3): the pane renders newest at the
- * TOP via #log's `flex-direction: column-reverse` — a pure CSS flip. DOM order
- * and the append-at-end pipeline are UNCHANGED: lines still append to the end
- * of #log, and that end is the visual TOP.
+ * Display order (t_9bc8a326): the pane ships NEWEST-FIRST (Rick's Option 3,
+ * t_7012e88c) — newest at the TOP via #log's `flex-direction:
+ * column-reverse`, a pure CSS flip. A checkbox in the title bar ("Newest
+ * first", checked by default) switches to OLDEST-FIRST (plain `column`,
+ * scrollback convention); the choice persists in localStorage
+ * (LOGDIR_KEY) and the <head> script in index.html restores it pre-paint
+ * (no flash). The flip is the `logold` class on <html>:
+ *   #log{flex-direction:column-reverse}  (default = newest-first)
+ *   html.logold #log{flex-direction:column}  (oldest-first)
+ * DOM order and the append-at-end pipeline are UNCHANGED in BOTH modes:
+ * lines still append to the end of #log; that end is the visual TOP in
+ * newest-first and the visual BOTTOM in oldest-first.
  *
- * IMPORTANT — the scroll axis is NEGATIVE under column-reverse (verified in
- * Chromium against this exact structure, test/): scrollTop 0 is the OLDEST end
- * of the content; scrollTop -(scrollHeight - clientHeight) is the NEWEST end.
- * Every pin and predicate below is written for that axis:
- *   - pin to newest:        log.scrollTop = -(log.scrollHeight - log.clientHeight)
- *   - "at newest" test:     log.scrollTop + (log.scrollHeight - log.clientHeight) < 24
- *   - user scrolling to read history moves scrollTop toward 0 (the oldest end);
- *     scrolling back to the newest line moves it back to the negative min.
- * Buffer capped at 5,000 nodes (capLog still removes firstElementChild = the
- * OLDEST line, which column-reverse renders at the BOTTOM — DOM removal is
- * unchanged).
+ * IMPORTANT — the scroll axis is DIRECTION-DEPENDENT (verified in Chromium
+ * against this exact structure, test/coord_system2.py):
+ *   newest-first (column-reverse): NEGATIVE axis. scrollTop 0 is the
+ *     OLDEST end; scrollTop -(scrollHeight - clientHeight) is the NEWEST
+ *     end.
+ *   oldest-first (column): POSITIVE axis. scrollTop 0 is the OLDEST end;
+ *     scrollTop +(scrollHeight - clientHeight) is the NEWEST end (at the
+ *     BOTTOM).
+ * Every pin and predicate below branches on logDir() ("new" | "old"):
+ *   - pin to newest:        newest-first -(range) / oldest-first +(range)
+ *   - "at newest" test:     newest-first (range + scrollTop < 24) /
+ *                           oldest-first (range - scrollTop < 24)
+ *   - user scrolling to read history moves away from the newest end either
+ *     way; the re-pin-on-append (delta ~line-height < 24 px tolerance) is
+ *     what keeps auto-follow at zero drift in BOTH modes.
+ * Buffer capped at 5,000 nodes (capLog still removes firstElementChild =
+ * the OLDEST line — DOM removal is direction-independent).
  *
  * Level coloring (spec): Ready=green Done=default Cancelled=yellow
  * Error=red Loading=blue; anything else dim. Log-line grammar:
@@ -921,53 +954,73 @@ function appendLog(item) {
     return;
   }
   const atNewest = atNewestBeforeInsert || isAtNewest();
-  // t_7012e88c AC-4: the initial tail:200 backfill arrives as a synchronous
-  // burst. Under column-reverse the browser settles the pane at scrollTop 0
-  // (the OLDEST end) — NOT the newest end — so the first paint would be
-  // oldest-on-top. While the burst is still draining (S._logSettled is
-  // false) we pin to newest on every appended line; the last line of the
-  // burst lands newest-on-top. After the burst we flip S._logSettled and
-  // hand control to the user (a deliberate scroll to read history is
-  // respected, no more forced pin). The settle window is short (see
-  // openLogStream's timeout) and only affects the very first paint.
-  const forcePin = !S._logSettled;
-  if (atNewest && !S.paused || forcePin) {
+  // t_7012e88c AC-4 / t_9bc8a326: the initial tail:200 backfill arrives as a
+  // synchronous burst. While the burst is draining (S._logSettled is false)
+  // the pane is landed at the reading start of the CURRENT display order and
+  // the chip counter is kept at 0 (the burst is history, not "new lines"):
+  //   newest-first: the browser would otherwise settle at scrollTop 0 (the
+  //     OLDEST end — negative axis) and the first paint would be
+  //     oldest-on-top, so every line force-pins to the newest end; the last
+  //     line of the burst lands newest-on-top (the t_7012e88c first paint).
+  //   oldest-first: the natural settle (scrollTop 0) IS the oldest end at
+  //     the top — already the correct reading start, no force-pin to the
+  //     newest needed; the branch just keeps the pane there and suppresses
+  //     the spurious "200 new lines" chip.
+  // After the burst we flip S._logSettled and hand control to the user (a
+  // deliberate scroll to read history is respected, no more forced pin).
+  // The settle window is short (see openLogStream's timeout) and only
+  // affects the very first paint.
+  if (!S._logSettled) {
+    if (logDir() === "new") { pinToNewest(); } else { $("log").scrollTop = 0; }
+    S.newLines = 0;
+  } else if (atNewest && !S.paused) {
     pinToNewest();
-    if (forcePin) S.newLines = 0;
   } else {
     S.newLines++;
     updateChip();
   }
 }
 
-// Pin #log so the NEWEST line sits at the top of the viewport. Under
-// column-reverse that is the NEGATIVE min of the scroll range (verified in
-// Chromium: scrollTop 0 = oldest end, -(scrollHeight-clientHeight) = newest
-// end). A no-op when the content fits the pane (range is 0).
+// Pin #log so the NEWEST line sits at the reading-start edge of the
+// viewport — the one the current display order shows first. The scroll
+// axis is direction-dependent (verified in Chromium against this exact
+// structure, test/coord_system2.py):
+//   newest-first (column-reverse, the default): NEGATIVE axis. scrollTop 0 =
+//     the OLDEST end, scrollTop -(scrollHeight - clientHeight) = the NEWEST
+//     end — pin target: the negative min.
+//   oldest-first (plain column): POSITIVE axis. scrollTop 0 = the OLDEST
+//     end (the reading start), scrollTop +(scrollHeight - clientHeight) =
+//     the NEWEST end at the BOTTOM — pin target: the positive max.
+// A no-op when the content fits the pane (range is 0).
 function pinToNewest() {
   const log = $("log");
-  log.scrollTop = -(log.scrollHeight - log.clientHeight);
+  const range = log.scrollHeight - log.clientHeight;
+  log.scrollTop = (logDir() === "old") ? range : -range;
 }
 
 function isAtNewest() {
   const log = $("log");
-  // t_7012e88c: under column-reverse the "newest end" is the NEGATIVE min of
-  // the scroll range, not the bottom. A pane with no geometry yet
-  // (clientHeight 0 — pre-layout on a fresh load, or hidden) is by INTENT
-  // following the newest line: it has no reading position to preserve, so we
-  // report "at newest". The bare formula already returns true in the
-  // zero-geometry case (0 + (0 - 0) = 0 < 24), so this guard makes the intent
-  // explicit and protects the callers (appendLog's pin, the scroll listener,
-  // and updateChip's "not at newest" branch) from any future change to the
-  // 24 px tolerance: a zero-geometry pane must always read "at newest".
-  // That is what keeps a fresh load and a collapsed→expand round trip free of
-  // the spurious "N new lines" chip while the engine is idle.
+  // A pane with no geometry yet (clientHeight 0 — pre-layout on a fresh
+  // load, or hidden while collapsed) is by INTENT following the newest
+  // line: it has no reading position to preserve, so we report "at
+  // newest". This guard makes the intent explicit and protects the callers
+  // (appendLog's pin, the scroll listener, and updateChip's "not at newest"
+  // branch) from any future change to the 24 px tolerance: a zero-geometry
+  // pane must always read "at newest". That is what keeps a fresh load and
+  // a collapsed→expand round trip free of the spurious "N new lines" chip
+  // while the engine is idle.
   if (log.clientHeight === 0) return true;
-  // distance from the newest end = how far the top of the content sits below
-  // the newest line; small (<=24px) means the newest line is at the viewport
-  // top. Equivalent to (range + scrollTop) where range = scrollHeight -
-  // clientHeight and scrollTop ranges over [-range, 0].
-  return log.scrollTop + (log.scrollHeight - log.clientHeight) < 24;
+  // Distance from the NEWEST end, on whichever axis the direction uses:
+  //   newest-first: range + scrollTop (scrollTop spans [-range, 0])
+  //   oldest-first: range - scrollTop (scrollTop spans [0, +range])
+  // Small (<=24px) means the newest line is at the reading-start edge of
+  // the viewport. Both formulas return 0 exactly at the newest-end pin and
+  // ~line-height (20px, < 24) right after a single append — which is what
+  // makes re-pin-on-append a zero-drift auto-follow in BOTH modes.
+  const range = log.scrollHeight - log.clientHeight;
+  return (logDir() === "old")
+    ? range - log.scrollTop < 24
+    : log.scrollTop + range < 24;
 }
 
 function capLog() {
@@ -986,9 +1039,11 @@ function updateChip() {
   const chip = $("pauseChip");
   const shouldShow = (S.paused || !isAtNewest()) && S.newLines > 0;
   if (shouldShow) {
-    // t_7012e88c: new lines now arrive at the TOP, so a paused/scrolled user
-    // has unread lines ABOVE the viewport — the chip arrow flips to ↑.
-    chip.textContent = `⏸ paused — ${S.newLines} new line${S.newLines > 1 ? "s" : ""} ↑`;
+    // The arrow points toward where NEW lines appear: ↑ in newest-first
+    // (unread lines above the viewport), ↓ in oldest-first (unread lines
+    // below it, at the newest end).
+    const arrow = (logDir() === "old") ? "↓" : "↑";
+    chip.textContent = `⏸ paused — ${S.newLines} new line${S.newLines > 1 ? "s" : ""} ${arrow}`;
     chip.classList.add("show");
   } else {
     chip.classList.remove("show");
@@ -997,11 +1052,46 @@ function updateChip() {
 
 function resumeLog() {
   S.paused = false;
-  pinToNewest();   // t_7012e88c: newest end = negative min, not scrollHeight
+  pinToNewest();   // the newest end, on whichever axis the direction uses
   S.newLines = 0;
   updateChip();
   $("btnPause").classList.remove("active");
   $("btnPause").textContent = "⏸ pause";
+}
+
+/* Flip the Log Stream display order (t_9bc8a326). Newest-first (checked)
+ * is the column-reverse default — Rick's `tail -f` convention; oldest-first
+ * (unchecked) is plain column — the scrollback-reading convention. The
+ * flip is a pure CSS class on <html> (html.logold); DOM order and the
+ * append-at-end pipeline are untouched, so a mid-stream toggle only flips
+ * the visual order. After the flip we re-pin to the new mode's reading
+ * start (newest end in newest-first, the oldest end in oldest-first — the
+ * spec's "simplest acceptable behaviour") and reset the unread counter:
+ * the same lines are still on screen, so "N new lines" would be a lie, and
+ * a fresh re-pin leaves nothing genuinely unread. */
+function setLogDir(dir) {
+  localStorage.setItem(LOGDIR_KEY, dir);
+  document.documentElement.classList.toggle("logold", dir === "old");
+  const log = $("log");
+  // The flip changes the axis under the pane's retained scrollTop, so the
+  // re-pin below fires a scroll event that is an artifact of the FLIP, not
+  // a user scroll — in oldest-first the reading start (scrollTop 0) is the
+  // far end from the newest, and an unguarded listener would misread the
+  // landing as "user scrolled away from newest" and count a phantom "1 new
+  // line". Anchor the same 50 ms scroll-guard window the collapse/expand
+  // transitions use (see init's scroll listener): nobody can meaningfully
+  // scroll a pane within 50 ms of a checkbox click.
+  S._collapseGuardAt = Date.now();
+  // Land at the new mode's reading start before any further append arrives.
+  if (dir === "new") {
+    pinToNewest();                       // negative min (no-op if range 0)
+  } else {
+    log.scrollTop = 0;                   // oldest end on the positive axis
+  }
+  S.newLines = 0;
+  updateChip();
+  const tgl = $("logOrderTgl");
+  if (tgl) tgl.checked = (dir === "new");
 }
 
 /* ---------------- SSE ----------------
@@ -1116,9 +1206,9 @@ function init() {
     const bar = cardId === "logwrap" ? card.querySelector(".lttl") : card.querySelector("h3");
     if (!bar) continue;
     bar.addEventListener("click", (e) => {
-      // The log title bar contains the ⏸ pause button — its clicks must
-      // NOT toggle the panel.
-      if (cardId === "logwrap" && e.target.closest("#btnPause")) return;
+      // The log title bar contains the ⏸ pause button AND the "Newest
+      // first" order checkbox — their clicks must NOT toggle the panel.
+      if (cardId === "logwrap" && e.target.closest("#btnPause, #logOrderWrap")) return;
       const next = !isCollapsed(cardId);
       // Only logwrap transitions reflow #log (clientHeight height ↔ 0), so
       // only they need the scroll-guard window (see init's scroll listener).
@@ -1131,11 +1221,14 @@ function init() {
           // geometry (the collapse below zeroes clientHeight): expandCard()
           // restores from these — the hidden pane's own scroll state is
           // meaningless (a display:none box reports 0/0).
-          // t_7012e88c: "at newest" is the negative end under column-reverse;
-          // the captured scrollTop (possibly negative) is restored verbatim by
-          // expandCard() — no conversion needed.
-          S._wasAtNewestAtCollapse =
-            $("log").scrollTop + ($("log").scrollHeight - $("log").clientHeight) < 24;
+          // t_9bc8a326: go through the shared direction-aware primitive
+          // instead of the raw negative-axis formula, so the capture is
+          // correct in BOTH display orders (a user paused mid-history in
+          // oldest-first mode must round-trip to the same spot).
+          // The captured scrollTop (negative in newest-first, positive in
+          // oldest-first) is restored verbatim by expandCard() — no
+          // conversion needed.
+          S._wasAtNewestAtCollapse = isAtNewest();
           S._logScrollAtCollapse = $("log").scrollTop;
         }
       }
@@ -1150,6 +1243,15 @@ function init() {
   fitTgl.checked = (fitMode() === "fit");
   fitTgl.addEventListener("change", () => {
     setFitMode(fitTgl.checked ? "fit" : "full");
+  });
+  // Display-order toggle (t_9bc8a326): the <head> script in index.html
+  // already applied the persisted direction to <html> pre-paint; here we
+  // sync the checkbox (checked = newest-first = default) and persist live
+  // toggles.
+  const logOrderTgl = $("logOrderTgl");
+  logOrderTgl.checked = (logDir() === "new");
+  logOrderTgl.addEventListener("change", () => {
+    setLogDir(logOrderTgl.checked ? "new" : "old");
   });
   openLogStream();
   pollStatus();
