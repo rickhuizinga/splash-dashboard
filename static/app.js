@@ -340,11 +340,15 @@ function renderKpis(p) {
   $("vDecode").innerHTML = dDec != null
     ? dDec.toFixed(1) + ' <span class="unit">tok/s</span>' : "—";
   $("tDecode").innerHTML = trendArrow(dDec, S.prev.decode);
-  $("sDecode").textContent = "engine-lifetime";
+  $("sDecode").textContent = m.decode_output_tokens != null
+    ? "engine-lifetime · " + fmtInt(m.decode_output_tokens) + " tok out"
+    : "engine-lifetime";
   $("vPrefill").innerHTML = dPre != null
     ? dPre.toFixed(1) + ' <span class="unit">tok/s</span>' : "—";
   $("tPrefill").innerHTML = trendArrow(dPre, S.prev.prefill);
-  $("sPrefill").textContent = "engine-lifetime";
+  $("sPrefill").textContent = m.prefill_input_tokens != null
+    ? "engine-lifetime · " + fmtInt(m.prefill_input_tokens) + " tok in"
+    : "engine-lifetime";
   $("vDraft").textContent = m.draft_acceptance_rate != null
     ? fmtPct(m.draft_acceptance_rate) : "—";
   $("sDraft").textContent = (m.drafted_tokens != null ?
