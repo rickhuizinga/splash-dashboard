@@ -380,6 +380,33 @@ function rows(pairs) {
     `<tr><td class="k">${k}</td><td class="v ${cls || ""}">${v}</td></tr>`).join("");
 }
 
+function renderActiveRequests(p) {
+  // Splash 1.3.2: top-level active_requests — one entry per in-flight
+  // request (id, phase, prompt progress, generated tokens, age). Older
+  // engines omit the key entirely → empty state, never throw.
+  let reqs = p.active_requests;
+  if (!Array.isArray(reqs)) reqs = [];
+  reqs = reqs.filter(q => q && typeof q === "object");
+  // newest first: engine request ids are monotonic
+  reqs.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
+  const CAP = 8;
+  if (!reqs.length) return '<tr><td class="k" colspan="5">no active requests</td></tr>';
+  const extra = Math.max(0, reqs.length - CAP);
+  let html = reqs.slice(0, CAP).map(q => {
+    const phase = q.phase != null ? esc(String(q.phase)) : "—";
+    // prefill in amber (subtle warn) so it reads as "in progress, not
+    // producing yet"; decode / any other phase the engine sends stays plain
+    return `<tr>` +
+      `<td class="v">${q.id != null ? "#" + fmtInt(q.id) : "—"}</td>` +
+      `<td class="v${q.phase === "prefill" ? " warn" : ""}">${phase}</td>` +
+      `<td class="v">${fmtInt(q.prompt_processed)} / ${fmtInt(q.prompt_tokens)}</td>` +
+      `<td class="v">${fmtInt(q.generated_tokens)}</td>` +
+      `<td class="v">${humanMs(q.age_ms)}</td></tr>`;
+  }).join("");
+  if (extra) html += `<tr><td class="k" colspan="5">+${extra} more…</td></tr>`;
+  return html;
+}
+
 function renderLive(p) {
   const sc = p.scheduler || {}, m = p.metrics || {};
   $("schedT").innerHTML = rows([
@@ -394,6 +421,7 @@ function renderLive(p) {
      `b3 ${fmtInt(sc.decode_batches_by_width && sc.decode_batches_by_width.b3)} · ` +
      `b4 ${fmtInt(sc.decode_batches_by_width && sc.decode_batches_by_width.b4)}`],
   ]);
+  $("activeReqB").innerHTML = renderActiveRequests(p);
   const db = m.current_decode_batch || {};
   $("dbatchT").innerHTML = db.valid ? rows([
     ["width", fmtInt(db.width)],
