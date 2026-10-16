@@ -121,6 +121,9 @@ html.full #memPanel{display:block}
 #livePanel .pbody{flex:1;min-height:0;overflow-y:auto;scrollbar-width:thin;
   scrollbar-color:var(--border) transparent}
 html.full #livePanel{display:block}
+/* columnar table: headers right-align over the right-justified numeric
+   data (td.v) — td.k defaults to left, which misaligns the header row */
+#activeReqT td{text-align:right}
 table.t{width:100%;border-collapse:collapse;font-size:13px}
 table.t td{padding:1px 0}
 table.t td.k{color:var(--dim)}
