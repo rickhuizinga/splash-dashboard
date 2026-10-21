@@ -145,6 +145,18 @@ table.t td.v.ok{color:var(--green)}
 #kvBarFill.warn{background:var(--amber)} #kvBarFill.bad{background:var(--red)}
 #kvLine{font-family:var(--mono);font-size:12.5px;color:var(--dim)}
 #kvLine b{color:var(--fg)}
+/* SSD spill tier (Splash 1.4.0, t_6ad1b4c7): the disk tier is the spill layer
+   of the same KV hierarchy, so it lives in this panel — same visual language
+   as the KV bar (a used/capacity bar above its rows). When the engine has no
+   disk tier (no --max-cache-disk, or capacity 0) #ssdSec is hidden and the one
+   muted #ssdOff line replaces it: never a 0 / 0 (0%) bar, never NaN. */
+#ssdBarWrap{background:var(--panel2);border-radius:5px;height:10px;overflow:hidden;
+  display:flex;margin:4px 0 3px}
+#ssdBarFill{height:100%;width:0%;background:var(--blue);transition:width .5s}
+#ssdBarFill.warn{background:var(--amber)} #ssdBarFill.bad{background:var(--red)}
+#ssdLine{font-family:var(--mono);font-size:12.5px;color:var(--dim)}
+#ssdLine b{color:var(--fg)}
+#ssdOff{font-size:12.5px;color:var(--faint)}
 .pressure{font-weight:700;letter-spacing:.5px}
 .pressure.normal{color:var(--green)} .pressure.warning{color:var(--amber)}
 .pressure.critical{color:var(--red)}
@@ -353,14 +365,22 @@ try{
     </div>
   </div>
   <div class="col">
-    <div class="panel" id="memPanel"><h3>Memory <span class="tag" id="memTag"></span><span class="cvr" aria-hidden="true">▾</span></h3>
+    <div class="panel" id="memPanel"><h3>Memory &amp; Cache <span class="tag" id="memTag"></span><span class="cvr" aria-hidden="true">▾</span></h3>
       <div class="pbody">
       <div id="memLine"></div>
       <div id="memBarWrap"><div id="memBarFill"></div></div>
       <div id="kvLine"></div>
       <div id="kvBarWrap"><div id="kvBarFill"></div></div>
       <table class="t" id="kvT"></table>
-      <table class="t" id="admT" style="margin-top:6px"></table>
+      <!-- SSD spill tier: hidden as a whole when the engine reports no disk
+           tier; #ssdOff is the only line rendered in that case. -->
+      <div id="ssdSec">
+        <h3 style="margin-top:8px">SSD spill tier <span class="tag">demote / restore · lifetime</span></h3>
+        <div id="ssdLine"></div>
+        <div id="ssdBarWrap"><div id="ssdBarFill"></div></div>
+        <table class="t" id="ssdT"></table>
+      </div>
+      <div id="ssdOff" hidden>SSD cache: disabled</div>
       </div>
     </div>
     <div class="panel" id="histPanel"><h3>Latency histograms <span class="tag">adaptive scale · client-diffed</span><span class="cvr" aria-hidden="true">▾</span></h3>

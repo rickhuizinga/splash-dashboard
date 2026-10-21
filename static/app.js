@@ -507,14 +507,85 @@ function renderMemory(p) {
       (kv.reclaimable_bytes ? ` · reclaimable ${fmtGiB(kv.reclaimable_bytes)}` : "")],
     ["governor headroom", fmtGiB(g.headroom_bytes) + " · host " + fmtGiB(g.host_headroom_bytes)],
   ]);
-  const ad = p.admission || {};
-  $("admT").innerHTML = rows([
-    ["admission waiting", fmtInt(ad.waiting) +
-      ` (mem ${fmtInt(ad.waiting_memory)} · conc ${fmtInt(ad.waiting_concurrency)})`],
-    ["suspended / draining", `${fmtInt(ad.suspended)} / ${ad.draining ? "yes" : "no"}`,
-      (ad.suspended || ad.draining) ? "warn" : ""],
-    ["oldest wait", humanMs(ad.oldest_wait_ms)],
-  ]);
+  // Admission rows ("admission waiting" / "suspended / draining" / "oldest
+  // wait") were dropped (t_6ad1b4c7) to free panel space for the SSD tier —
+  // the #admT table element is gone from index.html.
+  renderSSD(p);
+}
+
+/* ---------------- SSD spill tier (Splash 1.4.0) ---------------------------
+ * The KV cache is two-tier: the memory pool above, plus an optional disk tier
+ * that pages get DEMOTED to and RESTORED from on a prefix hit. The tier is
+ * engine-optional (no --max-cache-disk → no disk/kv_spill keys, or a zero
+ * capacity), so every read here is defensive: `|| {}` on the objects, null
+ * guards on every division. Disabled shape = one muted line, no bar, no rows.
+ * Health is exception-based: a "tier health" row appears ONLY when a failure
+ * counter is non-zero (no healthy-noise rows). Counters are engine-lifetime. */
+function ssdEnabled(p) {
+  const disk = p.disk;
+  const spill = p.kv_spill;
+  if (!disk || typeof disk !== "object") return false;
+  if (!spill || typeof spill !== "object") return false;
+  const cap = disk.capacity_bytes || disk.limit_bytes;
+  return typeof cap === "number" && Number.isFinite(cap) && cap > 0;
+}
+
+function renderSSD(p) {
+  const sec = $("ssdSec"), off = $("ssdOff");
+  if (!sec || !off) return;                       // panel not present
+  if (!ssdEnabled(p)) {
+    sec.hidden = true;
+    off.hidden = false;
+    return;
+  }
+  sec.hidden = false;
+  off.hidden = true;
+
+  const disk = p.disk || {};
+  const spill = p.kv_spill || {};
+  const cache = p.cache || {};
+
+  const cap = disk.capacity_bytes || disk.limit_bytes || 0;
+  const used = disk.used_bytes || 0;
+  const pct = cap > 0 ? Math.min(100, (used / cap) * 100) : 0;
+
+  const line = $("ssdLine");
+  if (line) {
+    line.innerHTML =
+      `SSD tier <b>${(used / GIB).toFixed(1)}</b> / ${(cap / GIB).toFixed(1)} GiB ` +
+      `<b>${pct.toFixed(0)}%</b>` +
+      (disk.persistent ? " &nbsp;·&nbsp; persistent" : "") +
+      (disk.kv_bytes ? ` &nbsp;·&nbsp; KV on disk ${fmtGiB(disk.kv_bytes)}` : "");
+  }
+  const bar = $("ssdBarFill");
+  if (bar) {
+    bar.style.width = pct.toFixed(1) + "%";
+    bar.className = pct > 90 ? "bad" : pct > 70 ? "warn" : "";
+  }
+
+  const ms = (spill.restores || {}).ms || {};
+  const pairs = [
+    ["demotions → restores", `${fmtInt(disk.kv_demotions)} → ${fmtInt(disk.kv_restores)} (lifetime)`],
+    ["SSD-saved prefill", `${fmtInt(cache.kv_disk_hit_tokens)} tokens`],
+    ["SSD I/O", `read ${fmtGiB(disk.read_bytes)} · written ${fmtGiB(disk.written_bytes)}` +
+      (ms.samples ? ` · restore p50 ${humanMs(ms.p50)} (n=${fmtInt(ms.samples)})` : "")],
+  ];
+
+  // Exception-based health row: nothing wrong = no row at all.
+  const wb = disk.write_behind || {};
+  const issues = [];
+  if (disk.kv_demotion_failures) issues.push(`${fmtInt(disk.kv_demotion_failures)} demotion failures`);
+  if (disk.kv_restore_failures) issues.push(`${fmtInt(disk.kv_restore_failures)} restore failures`);
+  if (disk.kv_copy_failures) issues.push(`${fmtInt(disk.kv_copy_failures)} copy failures`);
+  if (disk.kv_demotions_refused) issues.push(`${fmtInt(disk.kv_demotions_refused)} demotions refused`);
+  if (wb.refused) issues.push(`${fmtInt(wb.refused)} write-behind refused`);
+  if ((spill.write_through || {}).failures) issues.push(`${fmtInt(spill.write_through.failures)} write-through failures`);
+  if (disk.writes_gated && disk.writes_gated !== "no") issues.push(`writes gated (${disk.writes_gated})`);
+  if (cache.lost_state_misses) issues.push(`${fmtInt(cache.lost_state_misses)} lost-state misses`);
+  if (issues.length) pairs.push(["tier health", issues.join(" · "), "bad"]);
+
+  const tbl = $("ssdT");
+  if (tbl) tbl.innerHTML = rows(pairs);
 }
 
 function p_kv(p) {
