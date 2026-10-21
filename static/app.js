@@ -507,9 +507,9 @@ function renderMemory(p) {
       (kv.reclaimable_bytes ? ` · reclaimable ${fmtGiB(kv.reclaimable_bytes)}` : "")],
     ["governor headroom", fmtGiB(g.headroom_bytes) + " · host " + fmtGiB(g.host_headroom_bytes)],
   ]);
-  // Admission rows ("admission waiting" / "suspended / draining" / "oldest
-  // wait") were dropped (t_6ad1b4c7) to free panel space for the SSD tier —
-  // the #admT table element is gone from index.html.
+  // The three admission rows (waiting / suspended-draining / oldest wait) were
+  // dropped (t_6ad1b4c7) to free panel space for the SSD tier — the #admT
+  // table element is gone from index.html.
   renderSSD(p);
 }
 
