@@ -389,10 +389,8 @@ function renderActiveRequests(p) {
   reqs = reqs.filter(q => q && typeof q === "object");
   // newest first: engine request ids are monotonic
   reqs.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
-  const CAP = 8;
   if (!reqs.length) return '<tr><td class="k" colspan="5">no active requests</td></tr>';
-  const extra = Math.max(0, reqs.length - CAP);
-  let html = reqs.slice(0, CAP).map(q => {
+  let html = reqs.map(q => {
     const phase = q.phase != null ? esc(String(q.phase)) : "—";
     // prefill in amber (subtle warn) so it reads as "in progress, not
     // producing yet"; decode / any other phase the engine sends stays plain
@@ -403,7 +401,6 @@ function renderActiveRequests(p) {
       `<td class="v">${fmtInt(q.generated_tokens)}</td>` +
       `<td class="v">${humanMs(q.age_ms)}</td></tr>`;
   }).join("");
-  if (extra) html += `<tr><td class="k" colspan="5">+${extra} more…</td></tr>`;
   return html;
 }
 
