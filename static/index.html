@@ -130,6 +130,13 @@ table.t td.k{color:var(--dim)}
 table.t td.v{font-family:var(--mono);text-align:right;color:var(--fg)}
 table.t td.v.warn{color:var(--amber)} table.t td.v.bad{color:var(--red)}
 table.t td.v.ok{color:var(--green)}
+/* Priority column (t_d861eec2): the engine sends the words foreground /
+   normal / background; the cell renders a signed token relative to normal
+   (+1 / 0 / -1). background is dimmed to --faint so the eye lands on the
+   interactive work first. The column is dropped below 620px: at phone
+   widths the six-column table crowds and prompt/output lose readability. */
+table.t td.v.faint{color:var(--faint)}
+@media(max-width:620px){#activeReqT .prio{display:none}}
 /* memory */
 #memBarWrap{background:var(--panel2);border-radius:6px;height:16px;overflow:hidden;
   display:flex;margin:4px 0 2px}
@@ -350,7 +357,7 @@ try{
       <table class="t" id="schedT"></table>
       <h3 style="margin-top:8px">Active requests</h3>
       <table class="t" id="activeReqT">
-        <thead><tr><td class="k">id</td><td class="k">phase</td><td class="k">prompt</td><td class="k">output</td><td class="k">age</td></tr></thead>
+        <thead><tr><td class="k">id</td><td class="k prio">prio</td><td class="k">phase</td><td class="k">prompt</td><td class="k">output</td><td class="k">age</td></tr></thead>
         <tbody id="activeReqB"></tbody>
       </table>
       <h3 style="margin-top:8px">Current decode batch</h3>

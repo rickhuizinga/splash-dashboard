@@ -380,22 +380,42 @@ function rows(pairs) {
     `<tr><td class="k">${k}</td><td class="v ${cls || ""}">${v}</td></tr>`).join("");
 }
 
+// Engine priority strings (Splash 1.5.0) → compact display token + color
+// class. "+1 / 0 / -1" is a DISPLAY convention relative to `normal`, not the
+// engine's IntEnum ordering (Types.hpp:15-19 numbers them Foreground=0,
+// Normal=1, Background=2) — the token is derived from the word, never from
+// that number. An absent field renders "—"; an unrecognised word renders as-is.
+const PRIO_TOKEN = new Map([
+  ["foreground", ["+1", " ok"]],      // interactive work — green
+  ["normal",    ["0",  ""]],          // baseline — no color
+  ["background", ["-1", " faint"]],   // batch work — dim
+]);
+
 function renderActiveRequests(p) {
   // Splash 1.3.2: top-level active_requests — one entry per in-flight
-  // request (id, phase, prompt progress, generated tokens, age). Older
-  // engines omit the key entirely → empty state, never throw.
+  // request (id, phase, priority, prompt progress, generated tokens, age).
+  // Older engines omit the key entirely → empty state, never throw.
   let reqs = p.active_requests;
   if (!Array.isArray(reqs)) reqs = [];
   reqs = reqs.filter(q => q && typeof q === "object");
   // newest first: engine request ids are monotonic
   reqs.sort((a, b) => (Number(b.id) || 0) - (Number(a.id) || 0));
-  if (!reqs.length) return '<tr><td class="k" colspan="5">no active requests</td></tr>';
+  if (!reqs.length) return '<tr><td class="k" colspan="6">no active requests</td></tr>';
   let html = reqs.map(q => {
     const phase = q.phase != null ? esc(String(q.phase)) : "—";
+    // priority: absent (older engine) → "—", never throw.
+    // The cell keeps the engine's word in `title` so the token is inspectable.
+    // Sanitised to word chars so the value can never break the title attribute.
+    const prioKey = q.priority == null ? ""
+      : String(q.priority).trim().toLowerCase().replace(/[^\w-]/g, "");
+    // unknown words from a future engine fall through as-is rather than being
+    // blanked out — the column stays honest about what it saw.
+    const [prioTok, prioCls] = PRIO_TOKEN.get(prioKey) || [prioKey || "—", ""];
     // prefill in amber (subtle warn) so it reads as "in progress, not
     // producing yet"; decode / any other phase the engine sends stays plain
     return `<tr>` +
       `<td class="v">${q.id != null ? "#" + fmtInt(q.id) : "—"}</td>` +
+      `<td class="v prio${prioCls}" title="${esc(prioKey || "engine reported no priority")}">${prioTok}</td>` +
       `<td class="v${q.phase === "prefill" ? " warn" : ""}">${phase}</td>` +
       `<td class="v">${fmtInt(q.prompt_processed)} / ${fmtInt(q.prompt_tokens)}</td>` +
       `<td class="v">${fmtInt(q.generated_tokens)}</td>` +
