@@ -304,7 +304,13 @@ function renderHeader(p) {
   if (ins.pid != null) $("hPid").textContent = ins.pid;
   $("hSchema").textContent = "v" + (p.schema_version != null ? p.schema_version : "—");
   const b = p.identity && p.identity.cache && p.identity.cache.build_id;
-  $("hBuild").textContent = b ? b.slice(0, 8) : "—";
+  // Header shows the engine VERSION (dash.py resolves it from the installed
+  // binary, re-reading only when the running engine's build_id changes);
+  // the build_id stays discoverable in the hover tooltip — same pattern as
+  // hModel above. If the version is unknown (no check has ever succeeded),
+  // fall back to the build_id slice, which is what the header showed before.
+  $("hVersion").textContent = p.engine_version || (b ? b.slice(0, 8) : "—");
+  if (b) $("hVersion").title = "build " + b.slice(0, 8);
   $("hCtx").textContent = "context " + fmtInt(p.maximum_context_tokens) + " tokens";
   // uptime ticks every second
   tickUptime();

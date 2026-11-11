@@ -32,12 +32,14 @@ Log-following semantics (verified on this box, 2026-09-24):
   draining the old file first, and emits a "rotation" SSE marker.
 """
 import os
+import re
 import sys
 import json
 import time
 import uuid
 import glob
 import queue
+import subprocess
 import threading
 import argparse
 import http.client
@@ -269,6 +271,88 @@ TAILER = None  # populated in main()
 
 
 # --------------------------------------------------------------------------
+# Engine version resolution (t_6272b67f)
+# --------------------------------------------------------------------------
+# The engine's /status payload carries NO version field — only
+# identity.cache.build_id. The only available version source is the
+# installed binary: `splash --version` -> "Splash 1.5.0".
+#
+# Semantics (Rick-directed, 2026-11-09): build_id is the RUNNING engine's
+# self-identity; `splash --version` reads the binary ON DISK. After a
+# `brew upgrade` they diverge until the engine restarts, so we deliberately
+# re-read only when the running engine has actually changed (build_id
+# differs) — NOT on a pure timer (would report the installed version as if
+# running) and NOT on PID change (redundant, and false-triggers on
+# same-binary restarts). The dash process is long-lived (it has spanned
+# multiple engine upgrades without a restart), so a startup-only check
+# would go stale immediately; this per-poll trigger + cache keeps the hot
+# path subprocess-free.
+SPLASH_BIN = os.environ.get("SPLASH_BIN", "/opt/homebrew/bin/splash")
+VERSION_TIMEOUT = 5.0            # seconds for the `splash --version` subprocess
+VERSION_TTL = 6 * 3600.0         # seconds — stale-check fallback (see below)
+
+_VERSION_CACHE = {"build_id": None, "version": None, "checked_at": 0.0}
+_VERSION_LOCK = threading.Lock()
+
+
+def run_splash_version():
+    """Run `splash --version`; return the version token ("1.5.0") or None.
+
+    None on any failure: missing binary, non-zero exit, timeout, or
+    unparseable output. Never raises — callers are on the /api/status path
+    and the endpoint must keep serving."""
+    try:
+        proc = subprocess.run([SPLASH_BIN, "--version"],
+                              capture_output=True, text=True,
+                              timeout=VERSION_TIMEOUT)
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    m = re.search(r"Splash\s+(\S+)", proc.stdout or "")
+    return m.group(1) if m else None
+
+
+def resolve_engine_version(build_id):
+    """Best-known engine version for the given running build_id.
+
+    Re-runs run_splash_version() only when:
+      (a) build_id differs from the cached build_id — the running engine
+          has actually changed (the empty cache on the first poll counts
+          as a difference, so the first poll seeds it);
+      (b) no version has ever been obtained (cache version is None — the
+          previous check never succeeded -> retry);
+      (c) the last check is older than VERSION_TTL (fallback: insurance
+          for a pathological same-build_id upgrade, and the retry path for
+          a transient subprocess failure).
+    Otherwise the cached version is emitted — no subprocess on the hot
+    path.
+
+    A failed check KEEPS the previously cached version (emitting None only
+    when no check has ever succeeded) and re-anchors checked_at, so the
+    next retry waits out the TTL. An absent build_id (engine down / auth
+    failure / payload without identity) leaves the cache untouched and
+    emits the last-known version. Never raises.
+    """
+    with _VERSION_LOCK:
+        if build_id is None:
+            return _VERSION_CACHE["version"]
+        if _VERSION_CACHE["build_id"] != build_id:
+            need = True                          # (a) running engine changed
+        else:
+            need = (_VERSION_CACHE["version"] is None      # (b) retry
+                    or time.time() - _VERSION_CACHE["checked_at"] > VERSION_TTL)
+        if not need:
+            return _VERSION_CACHE["version"]
+        v = run_splash_version()
+        if v is not None:
+            _VERSION_CACHE["version"] = v
+        _VERSION_CACHE["checked_at"] = time.time()
+        _VERSION_CACHE["build_id"] = build_id
+        return _VERSION_CACHE["version"]
+
+
+# --------------------------------------------------------------------------
 # Status proxy (2 s cache + explicit down/auth states)
 # --------------------------------------------------------------------------
 class StatusProxy:
@@ -359,15 +443,17 @@ class StatusProxy:
 
     @staticmethod
     def reduce(data):
-        """Trim identity.* noise (keep build_id) and other v1-ignored blobs
-        while keeping every panel-relevant field."""
+        """Trim identity.* noise (keep build_id — the header's hover
+        tooltip) and other v1-ignored blobs, and add the resolved engine
+        version, while keeping every panel-relevant field."""
         out = dict(data)
         identity = data.get("identity") or {}
         cache = identity.get("cache") or {}
-        out["identity"] = {"cache": {"build_id": cache.get("build_id")},
-                           "stripped": True}
+        build_id = cache.get("build_id")
+        out["identity"] = {"cache": {"build_id": build_id}, "stripped": True}
         out.pop("http", None)
         out.pop("images", None)
+        out["engine_version"] = resolve_engine_version(build_id)
         out["populated_by"] = "splash-dash proxy"
         return out
 
