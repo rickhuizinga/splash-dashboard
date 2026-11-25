@@ -1042,17 +1042,25 @@ function insertDivider(text, cls) {
 // initial backfill's first paint.)
 function appendLog(item) {
   const log = $("log");
-  // t_7012e88c AC-6: divider items (rotation/restart) are TALLER than the
-  // 24px "at newest" tolerance, so the insert itself grows #log past the
-  // current pin — isAtNewest() read AFTER the insert would report a
-  // tail-following user as "scrolled away", skipping the re-pin and leaving
-  // the divider ~27px clipped above the viewport top with auto-follow dead
-  // until the next manual scroll (verified in Chromium: divider ≈ 29px).
-  // Capture the following state BEFORE the insert. A deliberate pause is
-  // still respected by the existing `&& !S.paused` below: a divider that
-  // lands on a paused pane counts as an unread line, like any other append.
-  const dividerItem = (item.type === "rotation" || item.type === "restart");
-  const atNewestBeforeInsert = dividerItem ? isAtNewest() : false;
+  // t_7012e88c AC-6 (dividers) + t_7cc6f656 (wrapped lines): the following
+  // state must be captured BEFORE the insert, for EVERY item type. The
+  // isAtNewest() "at newest" tolerance is a fixed 24 px, but a TALL insert
+  // grows #log past the current pin — a divider (≈29 px) or, more commonly,
+  // a log line that WRAPS to 2+ rows (42.3 px for 2 rows, up to 151 px for
+  // 6 rows at a narrow pane width; #log .l is flex-wrap with pre-wrap). An
+  // isAtNewest() read AFTER the insert would then report a tail-following
+  // user as "scrolled away", skip the re-pin, and leave the tall line
+  // clipped off the viewport with auto-follow dead. Nothing re-pins after
+  // that — every later append only grows the distance — so it is a one-way
+  // trap until a manual scroll back into tolerance or pause→resume. Capture
+  // the following state BEFORE the insert so the append path is independent
+  // of the new line's height; a genuine user scroll still reads "not at
+  // newest" on the NEXT append, so the read-history intent is preserved.
+  // (t_7012e88c first introduced this for dividers only; t_7cc6f656
+  // generalises it, since a wrapped line is the common tall insert.)
+  // A deliberate pause is still respected by the existing `&& !S.paused`
+  // below: any item that lands on a paused pane counts as an unread line.
+  const atNewestBeforeInsert = isAtNewest();
   if (item.type === "rotation") {
     insertDivider(`↻ log rotated (${esc(item.file || "log")}) — stream continued`, "rot");
   } else if (item.type === "restart") {
@@ -1079,7 +1087,14 @@ function appendLog(item) {
     if (S.paused) { S.newLines++; updateChip(); }
     return;
   }
-  const atNewest = atNewestBeforeInsert || isAtNewest();
+  // t_7cc6f656: the post-insert isAtNewest() read that used to be ORed in
+  // here is gone — it is exactly the misread that killed tail-follow on a
+  // wrapped line (post-insert geometry already includes the tall insert, so
+  // the 24 px tolerance is exceeded even though the user was following).
+  // The pre-insert capture above is the single source of truth: it reflects
+  // the pane's position just before this line landed, on whichever axis the
+  // current display order uses.
+  const atNewest = atNewestBeforeInsert;
   // t_7012e88c AC-4 / t_9bc8a326: the initial tail:200 backfill arrives as a
   // synchronous burst. While the burst is draining (S._logSettled is false)
   // the pane is landed at the reading start of the CURRENT display order and
